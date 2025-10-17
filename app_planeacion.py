@@ -74,6 +74,153 @@ def expand_analyses(prueba: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(rows).reset_index(drop=True)
     return out
 
+def calculate_arrival_rates(prueba: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    """
+    Calcula las tasas de llegada diarias por grupo basado en datos históricos.
+    
+    Fórmula: Tasa de llegada = Total de muestras del grupo G / Total de días en el periodo
+    
+    Returns:
+        Dict con estadísticas por grupo: {
+            'A': {'tasa_diaria': X, 'total_muestras': Y, 'dias_periodo': Z},
+            'B': {...}, 'C': {...}, 'D': {...}
+        }
+    """
+    # Expandir análisis para obtener datos por grupo individual
+    df_expanded = expand_analyses(prueba)
+    
+    # Calcular periodo total de datos
+    if "Fecha solicitud" not in df_expanded.columns:
+        return {}
+    
+    df_expanded["Fecha solicitud"] = pd.to_datetime(df_expanded["Fecha solicitud"], errors="coerce")
+    df_valid = df_expanded.dropna(subset=["Fecha solicitud"])
+    
+    if df_valid.empty:
+        return {}
+    
+    fecha_min = df_valid["Fecha solicitud"].min()
+    fecha_max = df_valid["Fecha solicitud"].max()
+    dias_periodo = (fecha_max - fecha_min).days + 1  # +1 para incluir ambos días
+    
+    # Calcular tasas por grupo
+    grupos_disponibles = ['A', 'B', 'C', 'D']
+    tasas_por_grupo = {}
+    
+    for grupo in grupos_disponibles:
+        # Filtrar muestras del grupo específico
+        muestras_grupo = df_valid[df_valid["Tipo de analisis"].str.strip() == grupo]
+        
+        if not muestras_grupo.empty:
+            # Total de muestras del grupo en el periodo
+            total_muestras = muestras_grupo["No muestras"].fillna(0).sum()
+            
+            # Calcular tasa de llegada diaria
+            tasa_diaria = total_muestras / dias_periodo if dias_periodo > 0 else 0
+            
+            # Información adicional
+            num_registros = len(muestras_grupo["Registro"].unique())
+            muestras_promedio_por_registro = total_muestras / num_registros if num_registros > 0 else 0
+            
+            tasas_por_grupo[grupo] = {
+                'tasa_diaria': round(tasa_diaria, 2),
+                'total_muestras': int(total_muestras),
+                'dias_periodo': dias_periodo,
+                'num_registros': num_registros,
+                'promedio_por_registro': round(muestras_promedio_por_registro, 1),
+                'fecha_inicio': fecha_min.strftime('%Y-%m-%d'),
+                'fecha_fin': fecha_max.strftime('%Y-%m-%d')
+            }
+        else:
+            # Grupo sin datos
+            tasas_por_grupo[grupo] = {
+                'tasa_diaria': 0.0,
+                'total_muestras': 0,
+                'dias_periodo': dias_periodo,
+                'num_registros': 0,
+                'promedio_por_registro': 0.0,
+                'fecha_inicio': fecha_min.strftime('%Y-%m-%d') if fecha_min else 'N/A',
+                'fecha_fin': fecha_max.strftime('%Y-%m-%d') if fecha_max else 'N/A'
+            }
+    
+    return tasas_por_grupo
+
+def analyze_capacity_vs_arrival_rates(arrival_rates: Dict[str, Dict[str, float]], daily_capacity: int = 38) -> Dict[str, Dict[str, float]]:
+    """
+    Analiza la relación entre tasas de llegada y capacidad diaria.
+    Calcula tiempos de espera y saturación por grupo.
+    
+    Args:
+        arrival_rates: Tasas de llegada por grupo (resultado de calculate_arrival_rates)
+        daily_capacity: Capacidad diaria total (38 muestras)
+    
+    Returns:
+        Análisis de capacidad por grupo con métricas de espera y saturación
+    """
+    
+    if not arrival_rates:
+        return {}
+    
+    # Calcular totales
+    tasa_total_diaria = sum(rates['tasa_diaria'] for rates in arrival_rates.values())
+    
+    analisis_por_grupo = {}
+    
+    for grupo, rates in arrival_rates.items():
+        tasa_grupo = rates['tasa_diaria']
+        
+        # Porcentaje de la demanda total que representa este grupo
+        porcentaje_demanda = (tasa_grupo / tasa_total_diaria * 100) if tasa_total_diaria > 0 else 0
+        
+        # Capacidad proporcional que debería asignarse a este grupo (basada en demanda actual)
+        capacidad_proporcional = (tasa_grupo / tasa_total_diaria * daily_capacity) if tasa_total_diaria > 0 else 0
+        
+        # Capacidad base teórica por grupo (distribución equitativa)
+        capacidad_base_grupo = daily_capacity / 4  # 38/4 = 9.5 muestras por grupo
+        
+        # Tiempo teórico para procesar la llegada diaria (si solo fuera este grupo)
+        dias_para_procesar_solo = tasa_grupo / daily_capacity if daily_capacity > 0 else float('inf')
+        
+        # Tiempo de espera estimado (asumiendo procesamiento equitativo)
+        tiempo_espera_dias = dias_para_procesar_solo if dias_para_procesar_solo > 1 else 0
+        
+        # Nivel de saturación del grupo (comparado con capacidad base teórica)
+        if tasa_grupo == 0:
+            saturacion = 0
+        else:
+            saturacion = tasa_grupo / capacidad_base_grupo
+        
+        # Clasificación de prioridad basada en saturación
+        if saturacion > 1.2:
+            prioridad_capacidad = "CRÍTICA"
+        elif saturacion > 0.8:
+            prioridad_capacidad = "ALTA"
+        elif saturacion > 0.5:
+            prioridad_capacidad = "MEDIA"
+        else:
+            prioridad_capacidad = "BAJA"
+        
+        analisis_por_grupo[grupo] = {
+            'tasa_llegada': tasa_grupo,
+            'porcentaje_demanda': round(porcentaje_demanda, 1),
+            'capacidad_proporcional': round(capacidad_proporcional, 1),
+            'tiempo_espera_dias': round(tiempo_espera_dias, 2),
+            'saturacion': round(saturacion, 2) if saturacion != float('inf') else 999.99,
+            'prioridad_capacidad': prioridad_capacidad,
+            'dias_acumulacion': round(dias_para_procesar_solo, 2) if dias_para_procesar_solo != float('inf') else 999.99
+        }
+    
+    # Agregar análisis global
+    analisis_por_grupo['GLOBAL'] = {
+        'tasa_total': round(tasa_total_diaria, 2),
+        'utilizacion_capacidad': round((tasa_total_diaria / daily_capacity * 100), 1) if daily_capacity > 0 else 0,
+        'capacidad_disponible': daily_capacity,
+        'deficit_superavit': round(daily_capacity - tasa_total_diaria, 2),
+        'estado_sistema': 'SOBRECARGADO' if tasa_total_diaria > daily_capacity else 'EQUILIBRADO' if tasa_total_diaria > daily_capacity * 0.8 else 'SUBUTILIZADO'
+    }
+    
+    return analisis_por_grupo
+
 def compute_kpis(foliar: pd.DataFrame) -> Dict[str, float]:
     subset = foliar.copy()
     if "Aplican" in subset.columns:
@@ -143,13 +290,21 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
        - Grupo D: NUNCA se combina con otros grupos
        - Optimiza capacidad diaria sin fragmentar registros ≤38 muestras
        - Registros >38 se fragmentan inteligentemente evaluando: antigüedad, porcentaje procesable, resto significativo
-       - Trata de cumplir umbral mínimo del 60% de capacidad (23 muestras/día)
+       - Trata de cumplir umbral mínimo del 75% de capacidad (29 muestras/día)
     """
     if daily_cap is None or daily_cap <= 0:
         daily_cap = 38  # Valor por defecto si hay algún problema
         st.warning(f"No se encontró capacidad diaria válida en la hoja 'Capacidad'. Usando valor por defecto: {daily_cap}")
 
     st.info(f"📊 **Capacidad diaria configurada: {daily_cap} muestras/día**")
+
+    # NUEVO: Calcular tasas de llegada por grupo para optimización
+    arrival_rates = calculate_arrival_rates(prueba)
+    capacity_analysis = analyze_capacity_vs_arrival_rates(arrival_rates, daily_cap)
+    
+    # Mostrar análisis de tasas de llegada
+    if arrival_rates:
+        st.info(f"📈 **Análisis de tasas de llegada calculado** - Estado del sistema: {capacity_analysis.get('GLOBAL', {}).get('estado_sistema', 'N/A')}")
 
     # Map de tiempos desde Excel
     tiempo = tiempo.copy()
@@ -217,12 +372,12 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
         return entregables
     
     def get_available_groups_sorted(df_temp: pd.DataFrame, current_day: datetime) -> List[Tuple[str, float, int]]:
-        """Retorna grupos disponibles ordenados por prioridad FIFO + urgencia 20 días"""
+        """Retorna grupos disponibles ordenados por prioridad FIFO + urgencia 20 días + tasas de llegada"""
         candidates = df_temp[df_temp["Pendiente"] > 0].copy()
         if candidates.empty:
             return []
         
-        # Calcular prioridad por grupo usando FIFO + urgencia
+        # Calcular prioridad por grupo usando FIFO + urgencia + tasas de llegada
         group_priority = []
         for grupo in candidates["Tipo de analisis"].unique():
             group_data = candidates[candidates["Tipo de analisis"] == grupo]
@@ -240,20 +395,62 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
                 
             muestras_grupo = group_data["Pendiente"].sum()
             
-            # NUEVA PRIORIDAD: FIFO + Urgencia 20 días
+            # NUEVO: Criterio directo basado en tasas de llegada
+            tasa_factor = 1.0  # Factor neutro por defecto
+            tasa_llegada_diaria = 0.0
+            capacidad_grupo = daily_cap / 4  # Capacidad equitativa por grupo (38/4 = 9.5)
+            
+            if capacity_analysis and grupo in capacity_analysis:
+                grupo_analysis = capacity_analysis[grupo]
+                tasa_llegada_diaria = grupo_analysis.get('tasa_llegada', 0.0)
+                saturacion = grupo_analysis.get('saturacion', 1.0)
+                
+                # CRITERIO 1: Ajuste por tasa de llegada vs capacidad base
+                ratio_tasa = tasa_llegada_diaria / capacidad_grupo if capacidad_grupo > 0 else 0
+                
+                if ratio_tasa > 1.5:  # Tasa muy alta vs capacidad base
+                    tasa_factor = 2.5  # Prioridad muy alta
+                elif ratio_tasa > 1.0:  # Tasa alta vs capacidad base  
+                    tasa_factor = 1.8  # Prioridad alta
+                elif ratio_tasa > 0.7:  # Tasa moderada
+                    tasa_factor = 1.3  # Prioridad moderada
+                elif ratio_tasa > 0.3:  # Tasa baja
+                    tasa_factor = 1.0  # Prioridad normal
+                else:  # Tasa muy baja
+                    tasa_factor = 0.7  # Prioridad reducida
+                
+                # CRITERIO 2: Ajuste adicional por saturación del sistema
+                if saturacion > 1.2:  # Sistema saturado para este grupo
+                    tasa_factor *= 1.5  # Multiplicador adicional
+                elif saturacion > 0.8:  # Sistema con alta carga
+                    tasa_factor *= 1.2  # Multiplicador moderado
+            
+            # PRIORIDAD COMPUESTA: FIFO + Urgencia 20 días + Tasa de Llegada
+            base_priority = 0
             if dias_antiguedad >= 20:
                 # URGENTE: Solicitudes ≥20 días tienen máxima prioridad
-                priority_score = 1000 + dias_antiguedad  # Base alta + días adicionales
+                base_priority = 1000 + dias_antiguedad  # Base alta + días adicionales
                 urgencia_msg = "🚨 URGENTE"
             else:
-                # NORMAL: Solo FIFO (más antiguos primero)
-                priority_score = dias_antiguedad
+                # NORMAL: FIFO + Criterio de tasa de llegada
+                base_priority = dias_antiguedad + (tasa_llegada_diaria * 10)  # Boost por tasa
                 urgencia_msg = "📅 Normal"
+            
+            # Aplicar factor de tasa de llegada
+            priority_score = base_priority * tasa_factor
+            
+            # Determinar mensaje de prioridad combinada
+            if tasa_factor >= 2.0:
+                urgencia_msg += " + 🔥 ALTA DEMANDA"
+            elif tasa_factor >= 1.5:
+                urgencia_msg += " + ⚡ DEMANDA ELEVADA"
+            elif tasa_factor >= 1.2:
+                urgencia_msg += " + ⚠️ DEMANDA MEDIA"
             
             if grupo in t_map:  # Solo considerar grupos con tiempos definidos
                 group_priority.append((grupo, priority_score, int(muestras_grupo), dias_antiguedad, urgencia_msg))
         
-        # Ordenar por prioridad descendente (más urgente/antiguo primero)
+        # Ordenar por prioridad descendente (más urgente/antiguo/saturado primero)
         sorted_groups = sorted(group_priority, key=lambda x: x[1], reverse=True)
         
         # Retornar formato esperado (grupo, score, muestras)
@@ -400,8 +597,8 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
                         registros_a_procesar.append((idx, muestras))
                     # Si no cabe completo, se deja para otro día (no fragmentar)
                 
-                # VERIFICACIÓN DE UMBRAL MÍNIMO (60% de capacidad = 23 muestras)
-                umbral_minimo = int(daily_cap * 0.6)  # 60% de 38 = 23 muestras
+                # VERIFICACIÓN DE UMBRAL MÍNIMO (75% de capacidad = 29 muestras)
+                umbral_minimo = int(daily_cap * 0.75)  # 75% de 38 = 29 muestras
                 necesita_mas_muestras = session_take < umbral_minimo
                 
                 # PASO 2: Si queda espacio O no se alcanzó el umbral, procesar registros grandes
@@ -435,14 +632,14 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
                                 porcentaje_procesable >= 0.6 or  # Se puede procesar >60%, vale la pena
                                 (espacio_restante >= 76 and resto_significativo) or  # Espacio grande y resto significativo
                                 not resto_significativo or  # El resto es <38, mejor terminarlo
-                                (necesita_mas_muestras and ayuda_umbral)  # Necesita alcanzar umbral del 60%
+                                (necesita_mas_muestras and ayuda_umbral)  # Necesita alcanzar umbral del 75%
                             )
                             
                             if debe_fragmentar and fragmento >= 38:
                                 if mejor_opcion is None:  # Solo si no hay opción completa
                                     mejor_opcion = (idx, fragmento, "fragmentado_inteligente")
                     
-                    # PASO 3: Si aún no se alcanza el umbral del 60%, buscar cualquier fragmento viable
+                    # PASO 3: Si aún no se alcanza el umbral del 75%, buscar cualquier fragmento viable
                     if necesita_mas_muestras and mejor_opcion is None and espacio_restante > 0:
                         for idx, muestras in registros_grandes:
                             reg_data = df_state.iloc[idx]
@@ -771,7 +968,7 @@ def plan_fifo_simple(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
     - Aplica restricciones por día (Lunes: A+D, Martes: B+C, etc.)
     - Grupo D: NUNCA se combina con otros grupos
     - Capacidad diaria = 38 muestras
-    - Umbral mínimo del 60% (23 muestras/día)
+    - Umbral mínimo del 75% (29 muestras/día)
     - Sin fragmentación inteligente (solo grupos de 38 para registros >38)
     """
     if daily_cap is None or daily_cap <= 0:
@@ -818,7 +1015,7 @@ def plan_fifo_simple(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
         registros_dia = registros_dia.sort_values("Fecha solicitud")
         
         muestras_procesadas_dia = 0
-        umbral_minimo = int(daily_cap * 0.6)  # 60% de 38 = 23 muestras
+        umbral_minimo = int(daily_cap * 0.75)  # 75% de 38 = 29 muestras
         
         # PASO 1: Procesar registros ≤38 muestras (completos)
         for idx, row in registros_dia.iterrows():
@@ -857,7 +1054,7 @@ def plan_fifo_simple(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
                 muestras_procesadas_dia += muestras
                 df_state.loc[idx, "Pendiente"] -= muestras
         
-        # PASO 2: Si no se alcanza umbral del 60%, procesar registros >38 en grupos de 38
+        # PASO 2: Si no se alcanza umbral del 75%, procesar registros >38 en grupos de 38
         if muestras_procesadas_dia < umbral_minimo:
             registros_grandes = registros_dia[registros_dia["Pendiente"] > 38].copy()
             
@@ -1008,11 +1205,11 @@ def to_excel_download(schedule: pd.DataFrame, pendientes: pd.DataFrame, util_df:
                 {"Concepto": "DESCRIPCIÓN DEL MODELO DE OPTIMIZACIÓN", "Optimizado": "", "FIFO Simple": "", "Mejora (%)": ""},
                 {"Concepto": "═══════════════════════════════════════", "Optimizado": "", "FIFO Simple": "", "Mejora (%)": ""},
                 {"Concepto": "Heurística aplicada:", "Optimizado": "Optimización de capacidad + FIFO inteligente", "FIFO Simple": "FIFO estricto sin optimización", "Mejora (%)": ""},
-                {"Concepto": "Estrategia de fragmentación:", "Optimizado": "≤38 nunca fragmentar, >38 decisión inteligente + umbral 60%", "FIFO Simple": "≤38 nunca fragmentar, >38 grupos de 38 + umbral 60%", "Mejora (%)": ""},
+                {"Concepto": "Estrategia de fragmentación:", "Optimizado": "≤38 nunca fragmentar, >38 decisión inteligente + umbral 75%", "FIFO Simple": "≤38 nunca fragmentar, >38 grupos de 38 + umbral 75%", "Mejora (%)": ""},
                 {"Concepto": "Mezcla de muestras:", "Optimizado": "Permite mezclar grupos compatibles", "FIFO Simple": "No mezcla registros/grupos", "Mejora (%)": ""},
                 {"Concepto": "Restricciones temporales:", "Optimizado": "Lunes: A+D, Martes: B+C, Mié/Jue: todos", "FIFO Simple": "Lunes: A+D, Martes: B+C, Mié/Jue: todos", "Mejora (%)": ""},
                 {"Concepto": "Grupo D:", "Optimizado": "NUNCA se combina con otros grupos", "FIFO Simple": "NUNCA se combina con otros grupos", "Mejora (%)": ""},
-                {"Concepto": "Umbral mínimo:", "Optimizado": "60% capacidad (23 muestras/día)", "FIFO Simple": "60% capacidad (23 muestras/día)", "Mejora (%)": ""},
+                {"Concepto": "Umbral mínimo:", "Optimizado": "75% capacidad (29 muestras/día)", "FIFO Simple": "75% capacidad (29 muestras/día)", "Mejora (%)": ""},
                 {"Concepto": "Priorización:", "Optimizado": "FIFO + urgencia 20 días + capacidad", "FIFO Simple": "FIFO estricto por fecha", "Mejora (%)": ""},
                 {"Concepto": "Programación semanal:", "Optimizado": "Lunes a Jueves (4 días disponibles)", "FIFO Simple": "Lunes a Jueves (4 días disponibles)", "Mejora (%)": ""},
                 {"Concepto": "", "Optimizado": "", "FIFO Simple": "", "Mejora (%)": ""},
@@ -1044,6 +1241,124 @@ def to_excel_download(schedule: pd.DataFrame, pendientes: pd.DataFrame, util_df:
             ]
             fallback_df = pd.DataFrame(fallback_data)
             fallback_df.to_excel(writer, sheet_name="Optimizacion", index=False)
+        
+        # NUEVA HOJA: Tasas de Llegada por Grupo
+        try:
+            if prueba is not None:
+                # Calcular tasas de llegada
+                arrival_rates = calculate_arrival_rates(prueba)
+                capacity_analysis = analyze_capacity_vs_arrival_rates(arrival_rates, daily_cap if daily_cap else 38)
+                
+                # Crear tabla de tasas de llegada
+                tasas_data = []
+                
+                # Encabezado
+                tasas_data.append({
+                    "Grupo": "ANÁLISIS DE TASAS DE LLEGADA POR GRUPO",
+                    "Tasa_Diaria_Muestras": "",
+                    "Total_Muestras_Historicas": "",
+                    "Dias_Periodo_Analizado": "",
+                    "Num_Registros": "",
+                    "Promedio_Muestras_por_Registro": "",
+                    "Porcentaje_Demanda_Total": "",
+                    "Capacidad_Proporcional_Sugerida": "",
+                    "Tiempo_Espera_Estimado_Dias": "",
+                    "Factor_Saturacion": "",
+                    "Prioridad_Capacidad": "",
+                    "Fecha_Inicio_Periodo": "",
+                    "Fecha_Fin_Periodo": ""
+                })
+                
+                tasas_data.append({
+                    "Grupo": "═══════════════════════════════════",
+                    "Tasa_Diaria_Muestras": "═══════════",
+                    "Total_Muestras_Historicas": "══════════════",
+                    "Dias_Periodo_Analizado": "══════════════",
+                    "Num_Registros": "════════",
+                    "Promedio_Muestras_por_Registro": "═══════════════════",
+                    "Porcentaje_Demanda_Total": "═══════════════",
+                    "Capacidad_Proporcional_Sugerida": "═══════════════════════",
+                    "Tiempo_Espera_Estimado_Dias": "═══════════════════",
+                    "Factor_Saturacion": "════════════",
+                    "Prioridad_Capacidad": "════════════════",
+                    "Fecha_Inicio_Periodo": "═══════════════",
+                    "Fecha_Fin_Periodo": "══════════════"
+                })
+                
+                # Datos por grupo
+                for grupo in ['A', 'B', 'C', 'D']:
+                    if grupo in arrival_rates:
+                        rates = arrival_rates[grupo]
+                        analysis = capacity_analysis.get(grupo, {})
+                        
+                        tasas_data.append({
+                            "Grupo": grupo,
+                            "Tasa_Diaria_Muestras": rates.get('tasa_diaria', 0),
+                            "Total_Muestras_Historicas": rates.get('total_muestras', 0),
+                            "Dias_Periodo_Analizado": rates.get('dias_periodo', 0),
+                            "Num_Registros": rates.get('num_registros', 0),
+                            "Promedio_Muestras_por_Registro": rates.get('promedio_por_registro', 0),
+                            "Porcentaje_Demanda_Total": f"{analysis.get('porcentaje_demanda', 0):.1f}%",
+                            "Capacidad_Proporcional_Sugerida": f"{analysis.get('capacidad_proporcional', 0):.1f}",
+                            "Tiempo_Espera_Estimado_Dias": f"{analysis.get('tiempo_espera_dias', 0):.1f}",
+                            "Factor_Saturacion": f"{analysis.get('saturacion', 0):.2f}x",
+                            "Prioridad_Capacidad": analysis.get('prioridad_capacidad', 'N/A'),
+                            "Fecha_Inicio_Periodo": rates.get('fecha_inicio', 'N/A'),
+                            "Fecha_Fin_Periodo": rates.get('fecha_fin', 'N/A')
+                        })
+                
+                # Análisis global
+                if 'GLOBAL' in capacity_analysis:
+                    global_stats = capacity_analysis['GLOBAL']
+                    tasas_data.extend([
+                        {
+                            "Grupo": "",
+                            "Tasa_Diaria_Muestras": "",
+                            "Total_Muestras_Historicas": "",
+                            "Dias_Periodo_Analizado": "",
+                            "Num_Registros": "",
+                            "Promedio_Muestras_por_Registro": "",
+                            "Porcentaje_Demanda_Total": "",
+                            "Capacidad_Proporcional_Sugerida": "",
+                            "Tiempo_Espera_Estimado_Dias": "",
+                            "Factor_Saturacion": "",
+                            "Prioridad_Capacidad": "",
+                            "Fecha_Inicio_Periodo": "",
+                            "Fecha_Fin_Periodo": ""
+                        },
+                        {
+                            "Grupo": "ANÁLISIS GLOBAL DEL SISTEMA",
+                            "Tasa_Diaria_Muestras": f"{global_stats.get('tasa_total', 0):.2f}",
+                            "Total_Muestras_Historicas": "Demanda Total/Día",
+                            "Dias_Periodo_Analizado": f"{global_stats.get('capacidad_disponible', 0)}",
+                            "Num_Registros": "Cap. Disponible",
+                            "Promedio_Muestras_por_Registro": f"{global_stats.get('utilizacion_capacidad', 0):.1f}%",
+                            "Porcentaje_Demanda_Total": "Utilización",
+                            "Capacidad_Proporcional_Sugerida": f"{global_stats.get('deficit_superavit', 0):+.1f}",
+                            "Tiempo_Espera_Estimado_Dias": "Balance Diario",
+                            "Factor_Saturacion": global_stats.get('estado_sistema', 'N/A'),
+                            "Prioridad_Capacidad": "Estado Sistema",
+                            "Fecha_Inicio_Periodo": "",
+                            "Fecha_Fin_Periodo": ""
+                        }
+                    ])
+                
+                # Crear y exportar DataFrame de tasas
+                tasas_df = pd.DataFrame(tasas_data)
+                tasas_df.to_excel(writer, sheet_name="Tasas_Llegada", index=False)
+            else:
+                # Fallback si no hay datos
+                fallback_tasas = pd.DataFrame([
+                    {"Grupo": "Sin datos disponibles", "Tasa_Diaria_Muestras": "N/A", "Informacion": "Requiere datos históricos para calcular tasas"}
+                ])
+                fallback_tasas.to_excel(writer, sheet_name="Tasas_Llegada", index=False)
+                
+        except Exception as e:
+            # Fallback en caso de error
+            error_tasas = pd.DataFrame([
+                {"Grupo": "ERROR", "Tasa_Diaria_Muestras": f"Error: {str(e)}", "Informacion": "No se pudieron calcular las tasas de llegada"}
+            ])
+            error_tasas.to_excel(writer, sheet_name="Tasas_Llegada", index=False)
     
     return out.getvalue()
 
@@ -1235,6 +1550,121 @@ with tab2:
             st.dataframe(df_tabla, use_container_width=True, hide_index=True)
 
         # Detalles técnicos en expanders
+        
+        # NUEVO EXPANDER: Análisis de Tasas de Llegada
+        with st.expander("📈 Análisis de Tasas de Llegada por Grupo"):
+            st.markdown("""
+            **🎯 Análisis Temporal de Demanda por Grupo**
+            
+            Este análisis calcula la **tasa de llegada diaria** de muestras por cada grupo (A, B, C, D) 
+            basado en los datos históricos disponibles.
+            """)
+            
+            # Calcular tasas de llegada para mostrar
+            arrival_rates = calculate_arrival_rates(prueba)
+            capacity_analysis = analyze_capacity_vs_arrival_rates(arrival_rates, daily_cap)
+            
+            if arrival_rates:
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.subheader("📊 Tasas de Llegada Calculadas")
+                    
+                    # Crear DataFrame para mostrar las tasas
+                    rates_data = []
+                    for grupo, data in arrival_rates.items():
+                        if grupo in ['A', 'B', 'C', 'D']:
+                            rates_data.append({
+                                '🎯 Grupo': grupo,
+                                '📈 Tasa Diaria': f"{data['tasa_diaria']:.2f}",
+                                '🧪 Total Muestras': data['total_muestras'],
+                                '📅 Días': data['dias_periodo'],
+                                '📋 Registros': data['num_registros'],
+                                '⚖️ Prom/Reg': f"{data['promedio_por_registro']:.1f}"
+                            })
+                    
+                    df_rates = pd.DataFrame(rates_data)
+                    st.dataframe(df_rates, use_container_width=True, hide_index=True)
+                
+                with col2:
+                    st.subheader("⚖️ Análisis de Capacidad")
+                    
+                    # Análisis detallado por grupo
+                    analysis_data = []
+                    for grupo in ['A', 'B', 'C', 'D']:
+                        if grupo in capacity_analysis:
+                            data = capacity_analysis[grupo]
+                            analysis_data.append({
+                                '🎯 Grupo': grupo,
+                                '📊 % Demanda': f"{data['porcentaje_demanda']:.1f}%",
+                                '⚖️ Cap. Sugerida': f"{data['capacidad_proporcional']:.1f}",
+                                '🔥 Saturación': f"{data['saturacion']:.2f}x",
+                                '⚡ Prioridad': data['prioridad_capacidad']
+                            })
+                    
+                    df_analysis = pd.DataFrame(analysis_data)
+                    
+                    # Colorear según prioridad
+                    def color_priority_mini(val):
+                        if val == 'CRÍTICA':
+                            return 'background-color: #ffebee; color: #c62828; font-weight: bold'
+                        elif val == 'ALTA':
+                            return 'background-color: #fff3e0; color: #ef6c00; font-weight: bold'
+                        elif val == 'MEDIA':
+                            return 'background-color: #f3e5f5; color: #7b1fa2'
+                        else:
+                            return 'background-color: #e8f5e8; color: #2e7d32'
+                    
+                    styled_df_mini = df_analysis.style.map(color_priority_mini, subset=['⚡ Prioridad'])
+                    st.dataframe(styled_df_mini, use_container_width=True, hide_index=True)
+                
+                # Análisis global del sistema
+                if 'GLOBAL' in capacity_analysis:
+                    global_stats = capacity_analysis['GLOBAL']
+                    
+                    st.subheader("🌐 Estado Global del Sistema")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric("🔥 Demanda Total", f"{global_stats['tasa_total']:.1f} muestras/día")
+                    with col2:
+                        st.metric("⚡ Capacidad Disp.", f"{global_stats['capacidad_disponible']} muestras/día")
+                    with col3:
+                        utilizacion = global_stats['utilizacion_capacidad']
+                        st.metric("📊 Utilización", f"{utilizacion:.1f}%")
+                    with col4:
+                        deficit = global_stats['deficit_superavit']
+                        st.metric("📈 Balance", f"{deficit:+.1f} muestras/día")
+                    
+                    # Estado del sistema
+                    estado = global_stats['estado_sistema']
+                    if estado == 'SOBRECARGADO':
+                        st.error(f"🚨 **Sistema {estado}**: La demanda excede la capacidad diaria disponible")
+                    elif estado == 'EQUILIBRADO':
+                        st.success(f"✅ **Sistema {estado}**: Demanda dentro de límites operativos")
+                    else:
+                        st.warning(f"⚠️ **Sistema {estado}**: Capacidad infrautilizada")
+                    
+                    # Recomendaciones compactas
+                    recomendaciones = []
+                    for grupo in ['A', 'B', 'C', 'D']:
+                        if grupo in capacity_analysis:
+                            data = capacity_analysis[grupo]
+                            prioridad = data['prioridad_capacidad']
+                            
+                            if prioridad == 'CRÍTICA':
+                                recomendaciones.append(f"🚨 **{grupo}**: Saturación crítica")
+                            elif prioridad == 'ALTA':
+                                recomendaciones.append(f"⚠️ **{grupo}**: Alta demanda")
+                    
+                    if recomendaciones:
+                        st.markdown("**💡 Alertas:**")
+                        for rec in recomendaciones:
+                            st.markdown(f"- {rec}")
+                            
+            else:
+                st.warning("⚠️ No se pudieron calcular las tasas de llegada. Verificar datos de fecha en las muestras.")
+
         with st.expander("📋 Detalle Completo de la Planeación"):
             st.dataframe(schedule, use_container_width=True)
             
@@ -1615,18 +2045,18 @@ with tab3:
            - Otros días: Procesa todos los grupos disponibles
         3. **Optimización de Capacidad**: 
            - Registros ≤38 muestras: Nunca fragmenta
-           - Umbral mínimo: Trata de alcanzar 60% capacidad (23 muestras/día)
+           - Umbral mínimo: Trata de alcanzar 75% capacidad (29 muestras/día)
            - Registros >38 muestras: Fragmentación inteligente que evalúa:
              * Antigüedad ≥15 días → Fragmentar prioritariamente
              * Porcentaje procesable ≥60% → Vale la pena fragmentar
              * Espacio disponible ≥76 y resto significativo → Fragmentar eficientemente
              * Resto <38 muestras → Mejor completar el registro
-             * Necesidad de umbral → Fragmentar para alcanzar 60% mínimo
+             * Necesidad de umbral → Fragmentar para alcanzar 75% mínimo
         4. **Mezcla Inteligente**: Combina grupos compatibles para maximizar uso de capacidad
         5. **Entrega Completa**: Solo entrega registros cuando TODOS sus grupos están completos
         6. **Prealistamiento Anticipado**: Permite preparar grupos el día anterior
         
         **Comparación con FIFO Simple:**
-        - FIFO simple: Procesamiento estricto por fecha, aplica restricciones diarias, capacidad 38, umbral 60%
+        - FIFO simple: Procesamiento estricto por fecha, aplica restricciones diarias, capacidad 38, umbral 75%
         - Optimizado: Flexibilidad para maximizar throughput manteniendo restricciones de negocio
         """)
