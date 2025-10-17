@@ -2031,32 +2031,3 @@ with tab3:
             except Exception as e:
                 st.error(f"❌ Error en el análisis: {str(e)}")
                 st.info("💡 Verifica que los datos estén cargados correctamente")
-    
-    st.markdown("---")
-    st.markdown("### 📖 Descripción Técnica de la Heurística")
-    
-    with st.expander("🔍 Ver detalles técnicos del algoritmo"):
-        st.markdown("""
-        **Algoritmo de Optimización Implementado:**
-        
-        1. **Fase de Priorización**: Ordena grupos por FIFO + urgencia (20 días) + cantidad disponible
-        2. **Fase de Asignación**: Para cada día (L-J):
-           - Martes: Solo procesa grupos B y C (excluye A)
-           - Otros días: Procesa todos los grupos disponibles
-        3. **Optimización de Capacidad**: 
-           - Registros ≤38 muestras: Nunca fragmenta
-           - Umbral mínimo: Trata de alcanzar 75% capacidad (29 muestras/día)
-           - Registros >38 muestras: Fragmentación inteligente que evalúa:
-             * Antigüedad ≥15 días → Fragmentar prioritariamente
-             * Porcentaje procesable ≥60% → Vale la pena fragmentar
-             * Espacio disponible ≥76 y resto significativo → Fragmentar eficientemente
-             * Resto <38 muestras → Mejor completar el registro
-             * Necesidad de umbral → Fragmentar para alcanzar 75% mínimo
-        4. **Mezcla Inteligente**: Combina grupos compatibles para maximizar uso de capacidad
-        5. **Entrega Completa**: Solo entrega registros cuando TODOS sus grupos están completos
-        6. **Prealistamiento Anticipado**: Permite preparar grupos el día anterior
-        
-        **Comparación con FIFO Simple:**
-        - FIFO simple: Procesamiento estricto por fecha, aplica restricciones diarias, capacidad 38, umbral 75%
-        - Optimizado: Flexibilidad para maximizar throughput manteniendo restricciones de negocio
-        """)
