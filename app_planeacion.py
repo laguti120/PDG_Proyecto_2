@@ -74,6 +74,54 @@ def expand_analyses(prueba: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(rows).reset_index(drop=True)
     return out
 
+
+def split_large_records(df: pd.DataFrame, cap: int) -> pd.DataFrame:
+    """
+    Divide filas con 'No muestras' mayores a `cap` en fragmentos de tamaño `cap`.
+    - Cada fragmento mantiene los mismos metadatos (Registro, Fecha solicitud, Tipo de analisis, etc.).
+    - Se genera un nuevo `ID analisis` con sufijos `-p1`, `-p2`, ... para los fragmentos.
+    - El fragmento final puede quedar con menos de `cap` y será tratado como registro pequeño
+      (permitiendo que el scheduler lo combine con otros ≤cap).
+    """
+    if df is None or df.empty:
+        return df.copy()
+
+    rows = []
+    for _, r in df.reset_index(drop=True).iterrows():
+        try:
+            nm = int(r.get("No muestras", 0) or 0)
+        except Exception:
+            nm = 0
+
+        base = r.to_dict()
+        base_id = str(base.get("ID analisis", base.get("Registro", "")))
+
+        if nm <= cap or nm <= 0:
+            # No es necesario fragmentar
+            rows.append(base)
+            continue
+
+        # Cuantos fragmentos completos de tamaño `cap`
+        full_parts = nm // cap
+        remainder = nm % cap
+        seq = 1
+
+        for i in range(full_parts):
+            new = base.copy()
+            new["No muestras"] = cap
+            new["ID analisis"] = f"{base_id}-p{seq}"
+            rows.append(new)
+            seq += 1
+
+        if remainder > 0:
+            new = base.copy()
+            new["No muestras"] = remainder
+            new["ID analisis"] = f"{base_id}-p{seq}"
+            rows.append(new)
+
+    out = pd.DataFrame(rows).reset_index(drop=True)
+    return out
+
 def calculate_arrival_rates(prueba: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     """
     Calcula las tasas de llegada diarias por grupo basado en datos históricos.
@@ -312,8 +360,14 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
     tiempo["Grupo"] = tiempo["Grupo"].astype(str).str.strip()
     t_map = tiempo.set_index("Grupo")[["Tiempo de prealistamiento (horas)", "Tiempo procesamiento (horas)"]].to_dict("index")
 
-    # Pedidos expandidos y ordenados por prioridad
-    df_original = expand_analyses(prueba)
+    # Pedidos expandidos (datos originales, sin fragmentar) - usados para totales
+    df_expanded = expand_analyses(prueba)
+    df_expanded = df_expanded.sort_values(by=["Fecha solicitud", "Registro"]).reset_index(drop=True)
+    df_expanded["Tipo de analisis"] = df_expanded["Tipo de analisis"].astype(str).str.strip()
+    df_expanded["Registro"] = df_expanded["Registro"].astype(str)
+
+    # División proactiva SOLO para el estado de procesamiento: fragmentar registros con más muestras que la capacidad diaria
+    df_original = split_large_records(df_expanded, daily_cap)
     df_original = df_original.sort_values(by=["Fecha solicitud", "Registro"]).reset_index(drop=True)
     df_original["Pendiente"] = df_original["No muestras"].fillna(0).astype(int)
     df_original["Tipo de analisis"] = df_original["Tipo de analisis"].astype(str).str.strip()
@@ -331,8 +385,8 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
     registros_info["Grupos_requeridos"] = registros_info["Tipo de analisis"].apply(lambda x: sorted(list(x)))
     registros_info["Total_grupos"] = registros_info["Grupos_requeridos"].apply(len)
 
-    # Totales por Registro para % progreso acumulado
-    totals_by_reg = df_original.groupby("Registro", as_index=False)["No muestras"].sum().rename(columns={"No muestras":"TotalRegistro"})
+    # Totales por Registro para % progreso acumulado (usar datos originales sin fragmentar)
+    totals_by_reg = df_expanded.groupby("Registro", as_index=False)["No muestras"].sum().rename(columns={"No muestras":"TotalRegistro"})
 
     # Días de la semana
     days = get_week_days(selected_date)
@@ -568,95 +622,102 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
                     take_d = min(pend_registro, remaining_daily - session_take)
                     if take_d > 0:
                         session_take += take_d
-                        registros_a_procesar.append((row.name, take_d))
+                        registros_a_procesar.append((row.name, take_d, "D"))
                         
                         # Para grupo D, procesar solo un registro por sesión
                         break
             else:
                 # Lógica normal para grupos A, B, C (pueden combinarse)
                 # Separar registros por tamaño ANTES de procesamiento
+                # Para los grupos B y C permitimos combinar registros de ambos grupos (aunque sean de distinto Registro)
+                combinable = False
+                if grupo in ["B", "C"]:
+                    combinable = True
+
+                if combinable:
+                    pool_df = df_state[(df_state["Pendiente"] > 0) & (df_state["Tipo de analisis"].isin(["B", "C"]))].copy()
+                else:
+                    pool_df = grp_df.copy()
+
                 registros_pequenos = []  # ≤38 muestras - NO se pueden fragmentar
                 registros_grandes = []   # >38 muestras - SE pueden fragmentar con decisión inteligente
-                
-                # Clasificar registros por tamaño
-                for _, row in grp_df.iterrows():
+
+                # Clasificar registros por tamaño (manteniendo el grupo de cada fila)
+                for _, row in pool_df.iterrows():
                     pend_registro = int(row["Pendiente"])
                     if pend_registro <= 0:
                         continue
                     if pend_registro <= 38:
-                        registros_pequenos.append((row.name, pend_registro))
+                        registros_pequenos.append((row.name, pend_registro, row["Tipo de analisis"]))
                     else:
-                        registros_grandes.append((row.name, pend_registro))
-                
+                        registros_grandes.append((row.name, pend_registro, row["Tipo de analisis"]))
+
                 # PASO 1: Procesar registros pequeños completos (≤38) - Sin fragmentación
-                registros_pequenos.sort(key=lambda x: x[1], reverse=True)  # Más grandes primero
-                
-                for idx, muestras in registros_pequenos:
+                # Ordenar por tamaño (más grandes primero) para mejor llenado
+                registros_pequenos.sort(key=lambda x: x[1], reverse=True)
+
+                for idx, muestras, grp_of in registros_pequenos:
                     if session_take + muestras <= remaining_daily:
                         session_take += muestras
-                        registros_a_procesar.append((idx, muestras))
+                        registros_a_procesar.append((idx, muestras, grp_of))
                     # Si no cabe completo, se deja para otro día (no fragmentar)
-                
-                # VERIFICACIÓN DE UMBRAL MÍNIMO (75% de capacidad = 29 muestras)
-                umbral_minimo = int(daily_cap * 0.75)  # 75% de 38 = 29 muestras
+
+                # VERIFICACIÓN DE UMBRAL MÍNIMO (75% de capacidad)
+                umbral_minimo = int(daily_cap * 0.75)
                 necesita_mas_muestras = session_take < umbral_minimo
-                
+
                 # PASO 2: Si queda espacio O no se alcanzó el umbral, procesar registros grandes
                 espacio_restante = remaining_daily - session_take
                 if (espacio_restante > 0 or necesita_mas_muestras) and registros_grandes:
-                    # Buscar el mejor registro grande para el espacio disponible
                     mejor_opcion = None
-                    
-                    for idx, muestras in registros_grandes:
+
+                    for idx, muestras, grp_of in registros_grandes:
                         reg_data = df_state.iloc[idx]
-                        
+
                         # OPCIÓN 1: ¿Cabe completo?
                         if muestras <= espacio_restante:
-                            mejor_opcion = (idx, muestras, "completo")
+                            mejor_opcion = (idx, muestras, grp_of, "completo")
                             break  # Completo es siempre mejor
-                        
+
                         # OPCIÓN 2: Evaluación inteligente para fragmentar
                         grupos_completos = espacio_restante // 38
                         if grupos_completos > 0:
                             fragmento = min(grupos_completos * 38, muestras)
-                            
-                            # Criterios para decidir si fragmentar inteligentemente:
-                            dias_antiguedad = (datetime.now() - pd.to_datetime(reg_data["Fecha solicitud"])).days
+
+                            dias_antiguedad = (datetime.now() - pd.to_datetime(reg_data["Fecha solicitud"])) .days
                             porcentaje_procesable = fragmento / muestras
                             resto_significativo = (muestras - fragmento) >= 38
                             ayuda_umbral = (session_take + fragmento) >= umbral_minimo
-                            
-                            # Decisión inteligente basada en múltiples factores
+
                             debe_fragmentar = (
-                                dias_antiguedad >= 15 or  # Muestra muy antigua, fragmentar
-                                porcentaje_procesable >= 0.6 or  # Se puede procesar >60%, vale la pena
-                                (espacio_restante >= 76 and resto_significativo) or  # Espacio grande y resto significativo
-                                not resto_significativo or  # El resto es <38, mejor terminarlo
-                                (necesita_mas_muestras and ayuda_umbral)  # Necesita alcanzar umbral del 75%
+                                dias_antiguedad >= 15 or
+                                porcentaje_procesable >= 0.6 or
+                                (espacio_restante >= 76 and resto_significativo) or
+                                not resto_significativo or
+                                (necesita_mas_muestras and ayuda_umbral)
                             )
-                            
+
                             if debe_fragmentar and fragmento >= 38:
-                                if mejor_opcion is None:  # Solo si no hay opción completa
-                                    mejor_opcion = (idx, fragmento, "fragmentado_inteligente")
-                    
+                                if mejor_opcion is None:
+                                    mejor_opcion = (idx, fragmento, grp_of, "fragmentado_inteligente")
+
                     # PASO 3: Si aún no se alcanza el umbral del 75%, buscar cualquier fragmento viable
                     if necesita_mas_muestras and mejor_opcion is None and espacio_restante > 0:
-                        for idx, muestras in registros_grandes:
+                        for idx, muestras, grp_of in registros_grandes:
                             reg_data = df_state.iloc[idx]
-                            dias_antiguedad = (datetime.now() - pd.to_datetime(reg_data["Fecha solicitud"])).days
-                            
-                            # Para alcanzar umbral, permitir fragmentos más pequeños si es urgente
-                            if dias_antiguedad >= 10 and espacio_restante >= 20:  # Flexibilidad para muestras urgentes
+                            dias_antiguedad = (datetime.now() - pd.to_datetime(reg_data["Fecha solicitud"])) .days
+
+                            if dias_antiguedad >= 10 and espacio_restante >= 20:
                                 fragmento_minimo = min(espacio_restante, muestras)
                                 if (session_take + fragmento_minimo) >= umbral_minimo:
-                                    mejor_opcion = (idx, fragmento_minimo, "umbral_60")
+                                    mejor_opcion = (idx, fragmento_minimo, grp_of, "umbral_60")
                                     break
-                    
+
                     # Aplicar la mejor opción encontrada
                     if mejor_opcion:
-                        idx, muestras, tipo = mejor_opcion
+                        idx, muestras, grp_of, tipo = mejor_opcion
                         session_take += muestras
-                        registros_a_procesar.append((idx, muestras))
+                        registros_a_procesar.append((idx, muestras, grp_of))
             
             if session_take <= 0:
                 break
@@ -668,7 +729,14 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
             # Asignar muestras según registros_a_procesar (respeta no-fragmentación)
             session_registros = []
             
-            for idx, take in registros_a_procesar:
+            for item in registros_a_procesar:
+                # item puede ser (idx, take, grupo_real)
+                if len(item) == 3:
+                    idx, take, grupo_real = item
+                else:
+                    idx, take = item
+                    grupo_real = grupo
+
                 pend = int(df_state.loc[idx, "Pendiente"])
                 
                 schedule_rows.append({
@@ -676,7 +744,7 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
                     "Inicio": proc_start,
                     "Fin": proc_end,
                     "Registro": str(df_state.loc[idx, "Registro"]),
-                    "Grupo": grupo,
+                    "Grupo": grupo_real,
                     "Tipo": "Procesamiento",
                     "Muestras": take,
                     "Fecha_Solicitud": df_state.loc[idx, "Fecha solicitud"]
@@ -771,6 +839,37 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
     pendientes = pend_base[["ID analisis","Registro","Tipo de analisis","Solicitadas","Procesadas","Pendiente"]]
 
     util_df = pd.DataFrame(daily_utilization)
+    # Asegurar que todos los días laborales (get_week_days) estén representados.
+    try:
+        expected_dates = [d.date() for d in days]
+        if util_df.empty:
+            # Crear filas con ceros para cada día
+            util_df = pd.DataFrame([{
+                "Fecha": ed,
+                "Utilización (%)": 0.0,
+                "Muestras procesadas": 0,
+                "Capacidad restante": daily_cap,
+                "Prep. anticipados": 0,
+                "Tiempo usado (h)": 0.0
+            } for ed in expected_dates])
+        else:
+            existing = set(pd.to_datetime(util_df["Fecha"]).dt.date.tolist())
+            missing = [ed for ed in expected_dates if ed not in existing]
+            for ed in missing:
+                util_df = pd.concat([util_df, pd.DataFrame([{
+                    "Fecha": ed,
+                    "Utilización (%)": 0.0,
+                    "Muestras procesadas": 0,
+                    "Capacidad restante": daily_cap,
+                    "Prep. anticipados": 0,
+                    "Tiempo usado (h)": 0.0
+                }])], ignore_index=True)
+        # Ordenar por Fecha
+        util_df["Fecha"] = pd.to_datetime(util_df["Fecha"]).dt.date
+        util_df = util_df.sort_values("Fecha").reset_index(drop=True)
+    except Exception:
+        # En caso de error inesperado, mantener lo calculado sin fallo
+        pass
 
     # Gantt semanal (concatenación de días)
     # CREAR TABLA DE PROGRESO POR REGISTRO Y CATEGORÍA
@@ -782,7 +881,12 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
         
         # Información base del registro
         fecha_solicitud = reg_data["Fecha solicitud"].iloc[0]
-        total_muestras = reg_data["No muestras"].iloc[0]
+        # Usar total original por registro (no fragmentado)
+        if (totals_by_reg["Registro"] == registro).any():
+            total_muestras = int(totals_by_reg.loc[totals_by_reg["Registro"] == registro, "TotalRegistro"].iloc[0])
+        else:
+            # Fallback: sumar las filas en el estado (si no se encuentra en totals_by_reg)
+            total_muestras = int(reg_data["No muestras"].sum())
         
         # Inicializar contadores por categoría (incluyendo Grupo D)
         progreso_reg = {
@@ -802,33 +906,34 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
             "Estado_Entrega": ""
         }
         
-        # Calcular progreso por cada grupo
+        # Calcular progreso por cada grupo (sumando fragmentos si existen)
         grupos_requeridos = []
         grupos_completados = []
-        
-        for _, row in reg_data.iterrows():
-            grupo = row["Tipo de analisis"]
-            procesadas = row["No muestras"] - row["Pendiente"]
-            pendientes = row["Pendiente"]
-            
-            grupos_requeridos.append(grupo)
-            
-            if grupo == "A":
-                progreso_reg["A_Procesadas"] = procesadas
-                progreso_reg["A_Pendientes"] = pendientes
-            elif grupo == "B":
-                progreso_reg["B_Procesadas"] = procesadas
-                progreso_reg["B_Pendientes"] = pendientes
-            elif grupo == "C":
-                progreso_reg["C_Procesadas"] = procesadas
-                progreso_reg["C_Pendientes"] = pendientes
-            elif grupo == "D":
-                progreso_reg["D_Procesadas"] = procesadas
-                progreso_reg["D_Pendientes"] = pendientes
-            
-            # Si está completado (pendientes = 0)
-            if pendientes == 0:
-                grupos_completados.append(grupo)
+
+        if not reg_data.empty:
+            group_sums = reg_data.groupby("Tipo de analisis").agg({"No muestras": "sum", "Pendiente": "sum"})
+            grupos_requeridos = sorted([g for g in group_sums.index.astype(str)])
+
+            for g in grupos_requeridos:
+                total_g = int(group_sums.loc[g, "No muestras"]) if g in group_sums.index else 0
+                pend_g = int(group_sums.loc[g, "Pendiente"]) if g in group_sums.index else 0
+                proc_g = total_g - pend_g
+
+                if g == "A":
+                    progreso_reg["A_Procesadas"] += proc_g
+                    progreso_reg["A_Pendientes"] += pend_g
+                elif g == "B":
+                    progreso_reg["B_Procesadas"] += proc_g
+                    progreso_reg["B_Pendientes"] += pend_g
+                elif g == "C":
+                    progreso_reg["C_Procesadas"] += proc_g
+                    progreso_reg["C_Pendientes"] += pend_g
+                elif g == "D":
+                    progreso_reg["D_Procesadas"] += proc_g
+                    progreso_reg["D_Pendientes"] += pend_g
+
+                if pend_g == 0:
+                    grupos_completados.append(g)
         
         # Determinar estado de entrega
         progreso_reg["Grupos_Requeridos"] = ", ".join(sorted(grupos_requeridos))
@@ -1642,8 +1747,7 @@ with tab2:
                         st.error(f"🚨 **Sistema {estado}**: La demanda excede la capacidad diaria disponible")
                     elif estado == 'EQUILIBRADO':
                         st.success(f"✅ **Sistema {estado}**: Demanda dentro de límites operativos")
-                    else:
-                        st.warning(f"⚠️ **Sistema {estado}**: Capacidad infrautilizada")
+                    # Para 'SUBUTILIZADO' no mostrar el texto de advertencia sobre capacidad infrautilizada
                     
                     # Recomendaciones compactas
                     recomendaciones = []
