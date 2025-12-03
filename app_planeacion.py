@@ -1122,7 +1122,7 @@ if (tiempo is None) or ("Grupo" not in tiempo.columns) or tiempo.empty:
 tab = st.container()
 
 with tab:
-    st.subheader("Parámetros de planeación (Lun–Vie)")
+    st.subheader("Parámetros de planeación (Lun–Jue)")
     today = datetime.today()
     selected_date = st.date_input("Selecciona cualquier día de la semana a planificar", value= today)
     cap_txt = f"{daily_cap} muestras/día" if daily_cap is not None else "sin tope diario (solo limitado por tiempo)"
