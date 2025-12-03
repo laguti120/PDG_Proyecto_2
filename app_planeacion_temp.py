@@ -609,21 +609,9 @@ default_path = "Insumo_Planeacion.xlsx"
 uploaded = st.sidebar.file_uploader("Cargar Excel personalizado", type=["xlsx", "xlsm"])
 foliar, prueba, tiempo, daily_cap = load_data(default_path, uploaded.getvalue() if uploaded else None)
 
-tab1, tab2 = st.tabs(["📚 Históricos", "🗓️ Planeación por día (capacidad diaria)"])
+tab1 = st.container()
 
 with tab1:
-    st.subheader("Tabla de históricos — Foliar (KPIs solo Aplican = SI)")
-    st.dataframe(foliar, width='stretch')
-    kpis = compute_kpis(foliar)
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric(label="% Cumplimiento (Aplican = SI)", value=f"{kpis.get('% Cumplimiento (solo Aplican=SI)', 0.0):.1f}%")
-    with c2:
-        st.metric(label="Tiempo promedio de entrega (días)", value=f"{kpis.get('Tiempo promedio de entrega (días)', 0.0):.2f}")
-    with c3:
-        st.metric(label="Casos considerados", value=f"{int(kpis.get('Casos considerados (Aplican=SI)', 0.0))}")
-
-with tab2:
     st.subheader("Parámetros de planeación (Lun–Vie)")
     today = datetime.today()
     selected_date = st.date_input("Selecciona cualquier día de la semana a planificar", value= today)

@@ -1,5 +1,7 @@
 
 import io
+import json
+import os
 import math
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Tuple
@@ -21,10 +23,56 @@ def load_data(default_path: str, uploaded: bytes | None):
         xls = pd.ExcelFile(uploaded)
     else:
         xls = pd.ExcelFile(default_path)
-    foliar = pd.read_excel(xls, sheet_name="Foliar")
-    prueba = pd.read_excel(xls, sheet_name="Prueba")
-    tiempo = pd.read_excel(xls, sheet_name="Tiempo")
-    capacidad = pd.read_excel(xls, sheet_name="Capacidad")
+
+    # Leer hoja 'Foliar' si existe; si no, crear DataFrame vacío con columnas esperadas
+    foliar = None
+    try:
+        if "Foliar" in xls.sheet_names:
+            foliar = pd.read_excel(xls, sheet_name="Foliar")
+        else:
+            # Crear DF vacío con columnas mínimas para evitar errores posteriores
+            foliar = pd.DataFrame(columns=["Aplican", "Cumple", "Entrega dias", "Fecha solicitud", "Fecha de entrega"]) 
+    except Exception:
+        # En caso de cualquier error, devolver DF vacío similar
+        foliar = pd.DataFrame(columns=["Aplican", "Cumple", "Entrega dias", "Fecha solicitud", "Fecha de entrega"]) 
+    # Prueba (aceptar nombre alternativo 'digestor' si se renombró la hoja)
+    prueba = None
+    try:
+        candidates = ["Prueba", "prueba", "digestor", "Digestor"]
+        for c in candidates:
+            if c in xls.sheet_names:
+                prueba = pd.read_excel(xls, sheet_name=c)
+                break
+        # Si no se encontró, intentar coincidencias parciales (por si el usuario cambió el nombre ligeramente)
+        if prueba is None:
+            for s in xls.sheet_names:
+                lname = s.lower()
+                if "pru" in lname or "dige" in lname:
+                    prueba = pd.read_excel(xls, sheet_name=s)
+                    break
+        # Si aún no hay 'prueba', crear DataFrame vacío con columnas esperadas
+        if prueba is None:
+            prueba = pd.DataFrame(columns=["Registro", "Tipo de analisis", "No muestras", "Fecha solicitud", "Fecha de entrega"])
+    except Exception:
+        prueba = pd.DataFrame(columns=["Registro", "Tipo de analisis", "No muestras", "Fecha solicitud", "Fecha de entrega"])
+
+    # Tiempo: si la hoja no existe, crear DataFrame vacío con columnas esperadas
+    try:
+        if "Tiempo" in xls.sheet_names:
+            tiempo = pd.read_excel(xls, sheet_name="Tiempo")
+        else:
+            tiempo = pd.DataFrame(columns=["Grupo", "Tiempo de prealistamiento (horas)", "Tiempo procesamiento (horas)"])
+    except Exception:
+        tiempo = pd.DataFrame(columns=["Grupo", "Tiempo de prealistamiento (horas)", "Tiempo procesamiento (horas)"])
+
+    # Capacidad: si falta, usare un DataFrame vacío y la función load_data aplicará valor por defecto
+    try:
+        if "Capacidad" in xls.sheet_names:
+            capacidad = pd.read_excel(xls, sheet_name="Capacidad")
+        else:
+            capacidad = pd.DataFrame()
+    except Exception:
+        capacidad = pd.DataFrame()
 
     foliar.columns = [c.strip() for c in foliar.columns]
     prueba.columns = [c.strip() for c in prueba.columns]
@@ -33,7 +81,10 @@ def load_data(default_path: str, uploaded: bytes | None):
 
     for c in ["Fecha solicitud", "Fecha de entrega"]:
         if c in foliar.columns:
-            foliar[c] = pd.to_datetime(foliar[c], errors="coerce")
+            try:
+                foliar[c] = pd.to_datetime(foliar[c], errors="coerce")
+            except Exception:
+                foliar[c] = pd.Series([], dtype='datetime64[ns]')
         if c in prueba.columns:
             prueba[c] = pd.to_datetime(prueba[c], errors="coerce")
 
@@ -122,152 +173,45 @@ def split_large_records(df: pd.DataFrame, cap: int) -> pd.DataFrame:
     out = pd.DataFrame(rows).reset_index(drop=True)
     return out
 
-def calculate_arrival_rates(prueba: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-    """
-    Calcula las tasas de llegada diarias por grupo basado en datos históricos.
-    
-    Fórmula: Tasa de llegada = Total de muestras del grupo G / Total de días en el periodo
-    
-    Returns:
-        Dict con estadísticas por grupo: {
-            'A': {'tasa_diaria': X, 'total_muestras': Y, 'dias_periodo': Z},
-            'B': {...}, 'C': {...}, 'D': {...}
-        }
-    """
-    # Expandir análisis para obtener datos por grupo individual
-    df_expanded = expand_analyses(prueba)
-    
-    # Calcular periodo total de datos
-    if "Fecha solicitud" not in df_expanded.columns:
-        return {}
-    
-    df_expanded["Fecha solicitud"] = pd.to_datetime(df_expanded["Fecha solicitud"], errors="coerce")
-    df_valid = df_expanded.dropna(subset=["Fecha solicitud"])
-    
-    if df_valid.empty:
-        return {}
-    
-    fecha_min = df_valid["Fecha solicitud"].min()
-    fecha_max = df_valid["Fecha solicitud"].max()
-    dias_periodo = (fecha_max - fecha_min).days + 1  # +1 para incluir ambos días
-    
-    # Calcular tasas por grupo
-    grupos_disponibles = ['A', 'B', 'C', 'D']
-    tasas_por_grupo = {}
-    
-    for grupo in grupos_disponibles:
-        # Filtrar muestras del grupo específico
-        muestras_grupo = df_valid[df_valid["Tipo de analisis"].str.strip() == grupo]
-        
-        if not muestras_grupo.empty:
-            # Total de muestras del grupo en el periodo
-            total_muestras = muestras_grupo["No muestras"].fillna(0).sum()
-            
-            # Calcular tasa de llegada diaria
-            tasa_diaria = total_muestras / dias_periodo if dias_periodo > 0 else 0
-            
-            # Información adicional
-            num_registros = len(muestras_grupo["Registro"].unique())
-            muestras_promedio_por_registro = total_muestras / num_registros if num_registros > 0 else 0
-            
-            tasas_por_grupo[grupo] = {
-                'tasa_diaria': round(tasa_diaria, 2),
-                'total_muestras': int(total_muestras),
-                'dias_periodo': dias_periodo,
-                'num_registros': num_registros,
-                'promedio_por_registro': round(muestras_promedio_por_registro, 1),
-                'fecha_inicio': fecha_min.strftime('%Y-%m-%d'),
-                'fecha_fin': fecha_max.strftime('%Y-%m-%d')
-            }
-        else:
-            # Grupo sin datos
-            tasas_por_grupo[grupo] = {
-                'tasa_diaria': 0.0,
-                'total_muestras': 0,
-                'dias_periodo': dias_periodo,
-                'num_registros': 0,
-                'promedio_por_registro': 0.0,
-                'fecha_inicio': fecha_min.strftime('%Y-%m-%d') if fecha_min else 'N/A',
-                'fecha_fin': fecha_max.strftime('%Y-%m-%d') if fecha_max else 'N/A'
-            }
-    
-    return tasas_por_grupo
 
-def analyze_capacity_vs_arrival_rates(arrival_rates: Dict[str, Dict[str, float]], daily_capacity: int = 38) -> Dict[str, Dict[str, float]]:
-    """
-    Analiza la relación entre tasas de llegada y capacidad diaria.
-    Calcula tiempos de espera y saturación por grupo.
-    
-    Args:
-        arrival_rates: Tasas de llegada por grupo (resultado de calculate_arrival_rates)
-        daily_capacity: Capacidad diaria total (38 muestras)
-    
-    Returns:
-        Análisis de capacidad por grupo con métricas de espera y saturación
-    """
-    
-    if not arrival_rates:
-        return {}
-    
-    # Calcular totales
-    tasa_total_diaria = sum(rates['tasa_diaria'] for rates in arrival_rates.values())
-    
-    analisis_por_grupo = {}
-    
-    for grupo, rates in arrival_rates.items():
-        tasa_grupo = rates['tasa_diaria']
-        
-        # Porcentaje de la demanda total que representa este grupo
-        porcentaje_demanda = (tasa_grupo / tasa_total_diaria * 100) if tasa_total_diaria > 0 else 0
-        
-        # Capacidad proporcional que debería asignarse a este grupo (basada en demanda actual)
-        capacidad_proporcional = (tasa_grupo / tasa_total_diaria * daily_capacity) if tasa_total_diaria > 0 else 0
-        
-        # Capacidad base teórica por grupo (distribución equitativa)
-        capacidad_base_grupo = daily_capacity / 4  # 38/4 = 9.5 muestras por grupo
-        
-        # Tiempo teórico para procesar la llegada diaria (si solo fuera este grupo)
-        dias_para_procesar_solo = tasa_grupo / daily_capacity if daily_capacity > 0 else float('inf')
-        
-        # Tiempo de espera estimado (asumiendo procesamiento equitativo)
-        tiempo_espera_dias = dias_para_procesar_solo if dias_para_procesar_solo > 1 else 0
-        
-        # Nivel de saturación del grupo (comparado con capacidad base teórica)
-        if tasa_grupo == 0:
-            saturacion = 0
-        else:
-            saturacion = tasa_grupo / capacidad_base_grupo
-        
-        # Clasificación de prioridad basada en saturación
-        if saturacion > 1.2:
-            prioridad_capacidad = "CRÍTICA"
-        elif saturacion > 0.8:
-            prioridad_capacidad = "ALTA"
-        elif saturacion > 0.5:
-            prioridad_capacidad = "MEDIA"
-        else:
-            prioridad_capacidad = "BAJA"
-        
-        analisis_por_grupo[grupo] = {
-            'tasa_llegada': tasa_grupo,
-            'porcentaje_demanda': round(porcentaje_demanda, 1),
-            'capacidad_proporcional': round(capacidad_proporcional, 1),
-            'tiempo_espera_dias': round(tiempo_espera_dias, 2),
-            'saturacion': round(saturacion, 2) if saturacion != float('inf') else 999.99,
-            'prioridad_capacidad': prioridad_capacidad,
-            'dias_acumulacion': round(dias_para_procesar_solo, 2) if dias_para_procesar_solo != float('inf') else 999.99
+# -------------------------
+# Persistent configuration
+# -------------------------
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+
+def read_config() -> dict:
+    """Leer configuración persistente si existe (capacidad y tiempos por grupo)."""
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    # Valores por defecto
+    return {
+        "daily_cap": 38,
+        "times": {
+            "A": {"pre": 2.0, "proc": 6.0},
+            "B": {"pre": 2.0, "proc": 6.0},
+            "C": {"pre": 2.0, "proc": 6.0},
+            "D": {"pre": 2.0, "proc": 6.0}
         }
-    
-    # Agregar análisis global
-    analisis_por_grupo['GLOBAL'] = {
-        'tasa_total': round(tasa_total_diaria, 2),
-        'utilizacion_capacidad': round((tasa_total_diaria / daily_capacity * 100), 1) if daily_capacity > 0 else 0,
-        'capacidad_disponible': daily_capacity,
-        'deficit_superavit': round(daily_capacity - tasa_total_diaria, 2),
-        'estado_sistema': 'SOBRECARGADO' if tasa_total_diaria > daily_capacity else 'EQUILIBRADO' if tasa_total_diaria > daily_capacity * 0.8 else 'SUBUTILIZADO'
     }
-    
-    return analisis_por_grupo
+
+def write_config(conf: dict) -> bool:
+    """Guardar configuración persistente en `config.json`. Devuelve True si tuvo éxito."""
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(conf, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+# NOTE: La función de cálculo de tasas de llegada históricas fue eliminada por petición del usuario.
+# Si se requiere más adelante, puede reimplementarse con la función `expand_analyses` como base.
+
+# NOTE: La función de análisis de capacidad vs tasas históricas fue eliminada por petición del usuario.
+    # NOTE: La función de análisis de capacidad vs tasas históricas fue eliminada por petición del usuario.
 
 def compute_kpis(foliar: pd.DataFrame) -> Dict[str, float]:
     subset = foliar.copy()
@@ -346,13 +290,7 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
 
     st.info(f"📊 **Capacidad diaria configurada: {daily_cap} muestras/día**")
 
-    # NUEVO: Calcular tasas de llegada por grupo para optimización
-    arrival_rates = calculate_arrival_rates(prueba)
-    capacity_analysis = analyze_capacity_vs_arrival_rates(arrival_rates, daily_cap)
-    
-    # Mostrar análisis de tasas de llegada
-    if arrival_rates:
-        st.info(f"📈 **Análisis de tasas de llegada calculado** - Estado del sistema: {capacity_analysis.get('GLOBAL', {}).get('estado_sistema', 'N/A')}")
+    # Nota: eliminación de análisis histórico/optimización — la planificación se ejecuta sin cálculos basados en historiales.
 
     # Map de tiempos desde Excel
     tiempo = tiempo.copy()
@@ -398,6 +336,8 @@ def plan_week_by_day(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: 
     
     # Estado global de muestras pendientes (se mantiene entre días)
     df_state = df_original.copy()
+    # Capacidad/tasas históricas fueron removidas; usar dict vacío como fallback
+    capacity_analysis: Dict[str, Dict] = {}
     
     def verificar_registro_completo(registro: str, df_estado: pd.DataFrame) -> tuple:
         """Verifica si un registro tiene todos sus grupos completados para entrega"""
@@ -1067,176 +1007,9 @@ def plot_gantt_user(df: pd.DataFrame, title: str, registros_info: pd.DataFrame =
     )
     st.plotly_chart(fig, use_container_width=True)
 
-def plan_fifo_simple(prueba: pd.DataFrame, tiempo: pd.DataFrame, selected_date: datetime, daily_cap: int):
-    """Algoritmo FIFO simple con reglas actualizadas:
-    - FIFO estricto por fecha de solicitud
-    - Aplica restricciones por día (Lunes: A+D, Martes: B+C, etc.)
-    - Grupo D: NUNCA se combina con otros grupos
-    - Capacidad diaria = 38 muestras
-    - Umbral mínimo del 75% (29 muestras/día)
-    - Sin fragmentación inteligente (solo grupos de 38 para registros >38)
-    """
-    if daily_cap is None or daily_cap <= 0:
-        daily_cap = 38  # Valor por defecto si hay algún problema
-
-    # Expandir análisis
-    df_original = expand_analyses(prueba)
-    df_original = df_original.sort_values(by=["Fecha solicitud", "Registro", "Tipo de analisis"]).reset_index(drop=True)
-    df_original["Pendiente"] = df_original["No muestras"].fillna(0).astype(int)
-
-    # Map de tiempos
-    tiempo = tiempo.copy()
-    tiempo["Grupo"] = tiempo["Grupo"].astype(str).str.strip()
-    t_map = tiempo.set_index("Grupo")[["Tiempo de prealistamiento (horas)", "Tiempo procesamiento (horas)"]].to_dict("index")
-
-    # Días de trabajo (L-J)
-    days = get_week_days(selected_date)
-    
-    df_state = df_original.copy()
-    schedule_rows = []
-    
-    # Procesar día por día aplicando las nuevas reglas
-    for d in days:
-        day_name = d.strftime('%A').lower()
-        
-        # Definir grupos permitidos por día
-        if day_name == 'monday':  # Lunes
-            grupos_permitidos = ['A', 'D']
-        elif day_name == 'tuesday':  # Martes  
-            grupos_permitidos = ['B', 'C']
-        else:  # Miércoles y Jueves
-            grupos_permitidos = ['A', 'B', 'C', 'D']
-        
-        # Filtrar registros disponibles para este día
-        registros_dia = df_state[
-            (df_state["Pendiente"] > 0) & 
-            (df_state["Tipo de analisis"].isin(grupos_permitidos))
-        ].copy()
-        
-        if registros_dia.empty:
-            continue
-            
-        # Ordenar por FIFO (fecha de solicitud)
-        registros_dia = registros_dia.sort_values("Fecha solicitud")
-        
-        muestras_procesadas_dia = 0
-        umbral_minimo = int(daily_cap * 0.75)  # 75% de 38 = 29 muestras
-        
-        # PASO 1: Procesar registros ≤38 muestras (completos)
-        for idx, row in registros_dia.iterrows():
-            if muestras_procesadas_dia >= daily_cap:
-                break
-                
-            grupo = row["Tipo de analisis"]
-            muestras = int(row["Pendiente"])
-            registro = row["Registro"]
-            
-            # Verificar restricción del Grupo D (no se combina)
-            if grupo == 'D' and muestras_procesadas_dia > 0:
-                continue  # Grupo D debe procesarse solo
-            if muestras_procesadas_dia > 0 and any(r["Grupo"] == 'D' for r in schedule_rows if r["Fecha"] == d.date()):
-                continue  # Ya hay Grupo D programado este día
-                
-            if muestras <= 38 and muestras_procesadas_dia + muestras <= daily_cap:
-                # Procesar completo
-                t_pre = t_map.get(grupo, {}).get("Tiempo de prealistamiento (horas)", 0) or 0
-                t_proc = t_map.get(grupo, {}).get("Tiempo procesamiento (horas)", 0) or 0
-                duracion_total = max(t_pre + t_proc, 0.1)
-                
-                inicio = d + timedelta(hours=8)  # Inicio a las 8:00
-                fin = inicio + timedelta(hours=duracion_total)
-                
-                schedule_rows.append({
-                    "Fecha": d.date(),
-                    "Registro": registro,
-                    "Grupo": grupo,
-                    "Muestras": muestras,
-                    "Inicio": inicio,
-                    "Fin": fin,
-                    "Duracion (h)": duracion_total
-                })
-                
-                muestras_procesadas_dia += muestras
-                df_state.loc[idx, "Pendiente"] -= muestras
-        
-        # PASO 2: Si no se alcanza umbral del 75%, procesar registros >38 en grupos de 38
-        if muestras_procesadas_dia < umbral_minimo:
-            registros_grandes = registros_dia[registros_dia["Pendiente"] > 38].copy()
-            
-            for idx, row in registros_grandes.iterrows():
-                if muestras_procesadas_dia >= daily_cap:
-                    break
-                    
-                grupo = row["Tipo de analisis"]
-                muestras_disponibles = int(row["Pendiente"])
-                registro = row["Registro"]
-                
-                # Verificar restricción del Grupo D
-                if grupo == 'D' and muestras_procesadas_dia > 0:
-                    continue
-                if muestras_procesadas_dia > 0 and any(r["Grupo"] == 'D' for r in schedule_rows if r["Fecha"] == d.date()):
-                    continue
-                
-                espacio_restante = daily_cap - muestras_procesadas_dia
-                grupos_de_38 = espacio_restante // 38
-                
-                if grupos_de_38 > 0:
-                    muestras_a_procesar = min(grupos_de_38 * 38, muestras_disponibles)
-                    
-                    # Solo fragmentar si ayuda a alcanzar el umbral
-                    if (muestras_procesadas_dia + muestras_a_procesar) >= umbral_minimo or muestras_a_procesar == muestras_disponibles:
-                        t_pre = t_map.get(grupo, {}).get("Tiempo de prealistamiento (horas)", 0) or 0
-                        t_proc = t_map.get(grupo, {}).get("Tiempo procesamiento (horas)", 0) or 0
-                        duracion_total = max(t_pre + t_proc, 0.1)
-                        
-                        inicio = d + timedelta(hours=8)
-                        fin = inicio + timedelta(hours=duracion_total)
-                        
-                        schedule_rows.append({
-                            "Fecha": d.date(),
-                            "Registro": registro,
-                            "Grupo": grupo,
-                            "Muestras": muestras_a_procesar,
-                            "Inicio": inicio,
-                            "Fin": fin,
-                            "Duracion (h)": duracion_total
-                        })
-                        
-                        muestras_procesadas_dia += muestras_a_procesar
-                        df_state.loc[idx, "Pendiente"] -= muestras_a_procesar
-                        break  # Solo un registro grande por día
-    
-    # Crear DataFrames resultado
-    if schedule_rows:
-        schedule_df = pd.DataFrame(schedule_rows)
-    else:
-        schedule_df = pd.DataFrame(columns=["Fecha", "Registro", "Grupo", "Muestras", "Inicio", "Fin", "Duracion (h)"])
-    
-    # Calcular pendientes correctamente (restar lo que se programó)
-    # Crear diccionario de muestras procesadas por registro+grupo
-    procesadas_dict = {}
-    for row in schedule_rows:
-        key = f"{row['Registro']}_{row['Grupo']}"
-        procesadas_dict[key] = procesadas_dict.get(key, 0) + row["Muestras"]
-    
-    # Pendientes (lo que no se procesó)
-    pendientes_rows = []
-    for _, row in df_state.iterrows():
-        key = f"{row['Registro']}_{row['Tipo de analisis']}"
-        muestras_procesadas = procesadas_dict.get(key, 0)
-        muestras_pendientes = max(0, row["Pendiente"] - muestras_procesadas)
-        
-        if muestras_pendientes > 0:  # Solo agregar si realmente quedan pendientes
-            pendientes_rows.append({
-                "Registro": row["Registro"],
-                "Grupo": row["Tipo de analisis"],
-                "Muestras": muestras_pendientes,
-                "Fecha solicitud": row["Fecha solicitud"]
-            })
-    
-    pendientes_df = pd.DataFrame(pendientes_rows) if pendientes_rows else pd.DataFrame()
-    
-    return schedule_df, pendientes_df
+# NOTE: La implementación del algoritmo FIFO simple (plan_fifo_simple) fue eliminada
+# por petición del usuario. Si se requiere una versión simplificada en el futuro,
+# puede reimplementarse usando `expand_analyses` y reglas FIFO básicas.
 
 def to_excel_download(schedule: pd.DataFrame, pendientes: pd.DataFrame, util_df: pd.DataFrame,
                       gantt_week: pd.DataFrame, gantt_per_day: Dict, prueba: pd.DataFrame = None, 
@@ -1278,217 +1051,77 @@ def to_excel_download(schedule: pd.DataFrame, pendientes: pd.DataFrame, util_df:
                     sheet = f"Gantt_{k.strftime('%a')}"
                     v.to_excel(writer, sheet_name=sheet, index=False)
         
-        # NUEVA HOJA: Análisis de Optimización (SIEMPRE se genera)
-        try:
-            # Ejecutar FIFO simple para comparación (si hay datos)
-            schedule_fifo = pd.DataFrame()
-            pendientes_fifo = pd.DataFrame()
-            
-            if all(x is not None for x in [prueba, tiempo, selected_date, daily_cap]):
-                schedule_fifo, pendientes_fifo = plan_fifo_simple(prueba, tiempo, selected_date, daily_cap)
-            
-            # Crear análisis comparativo
-            optimizacion_data = []
-            
-            # Métricas del modelo optimizado
-            muestras_opt = schedule["Muestras"].sum() if isinstance(schedule, pd.DataFrame) and not schedule.empty and "Muestras" in schedule.columns else 0
-            pendientes_opt = pendientes["Pendiente"].sum() if isinstance(pendientes, pd.DataFrame) and not pendientes.empty and "Pendiente" in pendientes.columns else 0
-            dias_opt = len(schedule["Fecha"].unique()) if isinstance(schedule, pd.DataFrame) and not schedule.empty and "Fecha" in schedule.columns else 0
-            
-            # Métricas del FIFO simple
-            muestras_fifo = schedule_fifo["Muestras"].sum() if not schedule_fifo.empty and "Muestras" in schedule_fifo.columns else 0
-            pendientes_fifo_total = pendientes_fifo["Muestras"].sum() if not pendientes_fifo.empty and "Muestras" in pendientes_fifo.columns else 0
-            dias_fifo = len(schedule_fifo["Fecha"].unique()) if not schedule_fifo.empty and "Fecha" in schedule_fifo.columns else 0
-            
-            # Calcular porcentajes de optimización
-            mejora_muestras = ((muestras_opt - muestras_fifo) / max(muestras_fifo, 1)) * 100 if muestras_fifo > 0 else 0
-            mejora_pendientes = ((pendientes_fifo_total - pendientes_opt) / max(pendientes_fifo_total, 1)) * 100 if pendientes_fifo_total > 0 else 0
-            ahorro_dias = max(0, dias_fifo - dias_opt)
-            
-            # Información del modelo (SIEMPRE se incluye)
-            optimizacion_data.extend([
-                {"Concepto": "DESCRIPCIÓN DEL MODELO DE OPTIMIZACIÓN", "Optimizado": "", "FIFO Simple": "", "Mejora (%)": ""},
-                {"Concepto": "═══════════════════════════════════════", "Optimizado": "", "FIFO Simple": "", "Mejora (%)": ""},
-                {"Concepto": "Heurística aplicada:", "Optimizado": "Optimización de capacidad + FIFO inteligente", "FIFO Simple": "FIFO estricto sin optimización", "Mejora (%)": ""},
-                {"Concepto": "Estrategia de fragmentación:", "Optimizado": "≤38 nunca fragmentar, >38 decisión inteligente + umbral 75%", "FIFO Simple": "≤38 nunca fragmentar, >38 grupos de 38 + umbral 75%", "Mejora (%)": ""},
-                {"Concepto": "Mezcla de muestras:", "Optimizado": "Permite mezclar grupos compatibles", "FIFO Simple": "No mezcla registros/grupos", "Mejora (%)": ""},
-                {"Concepto": "Restricciones temporales:", "Optimizado": "Lunes: A+D, Martes: B+C, Mié/Jue: todos", "FIFO Simple": "Lunes: A+D, Martes: B+C, Mié/Jue: todos", "Mejora (%)": ""},
-                {"Concepto": "Grupo D:", "Optimizado": "NUNCA se combina con otros grupos", "FIFO Simple": "NUNCA se combina con otros grupos", "Mejora (%)": ""},
-                {"Concepto": "Umbral mínimo:", "Optimizado": "75% capacidad (29 muestras/día)", "FIFO Simple": "75% capacidad (29 muestras/día)", "Mejora (%)": ""},
-                {"Concepto": "Priorización:", "Optimizado": "FIFO + urgencia 20 días + capacidad", "FIFO Simple": "FIFO estricto por fecha", "Mejora (%)": ""},
-                {"Concepto": "Programación semanal:", "Optimizado": "Lunes a Jueves (4 días disponibles)", "FIFO Simple": "Lunes a Jueves (4 días disponibles)", "Mejora (%)": ""},
-                {"Concepto": "", "Optimizado": "", "FIFO Simple": "", "Mejora (%)": ""},
-                {"Concepto": "RESULTADOS COMPARATIVOS", "Optimizado": "", "FIFO Simple": "", "Mejora (%)": ""},
-                {"Concepto": "════════════════════════", "Optimizado": "", "FIFO Simple": "", "Mejora (%)": ""},
-                {"Concepto": "Muestras procesadas:", "Optimizado": f"{muestras_opt:,.0f}", "FIFO Simple": f"{muestras_fifo:,.0f}", "Mejora (%)": f"{mejora_muestras:+.1f}%"},
-                {"Concepto": "Muestras pendientes:", "Optimizado": f"{pendientes_opt:,.0f}", "FIFO Simple": f"{pendientes_fifo_total:,.0f}", "Mejora (%)": f"{mejora_pendientes:+.1f}%"},
-                {"Concepto": "Días utilizados:", "Optimizado": f"{dias_opt}", "FIFO Simple": f"{dias_fifo}", "Mejora (%)": f"{ahorro_dias} días ahorrados"},
-                {"Concepto": "Utilización capacidad:", "Optimizado": f"{(muestras_opt/(dias_opt*daily_cap)*100):,.1f}%" if dias_opt > 0 and daily_cap > 0 else "N/A", "FIFO Simple": f"{(muestras_fifo/(dias_fifo*daily_cap)*100):,.1f}%" if dias_fifo > 0 and daily_cap > 0 else "N/A", "Mejora (%)": ""},
-                {"Concepto": "", "Optimizado": "", "FIFO Simple": "", "Mejora (%)": ""},
-                {"Concepto": "CONCLUSIONES", "Optimizado": "", "FIFO Simple": "", "Mejora (%)": ""},
-                {"Concepto": "═══════════", "Optimizado": "", "FIFO Simple": "", "Mejora (%)": ""},
-                {"Concepto": "Optimización general:", "Optimizado": "✅ Mayor throughput y eficiencia", "FIFO Simple": "❌ Menor utilización de recursos", "Mejora (%)": f"{max(mejora_muestras, mejora_pendientes):+.1f}% promedio"},
-                {"Concepto": "Gestión de capacidad:", "Optimizado": "✅ Aprovecha capacidad máxima", "FIFO Simple": "❌ Desperdicia capacidad diaria", "Mejora (%)": ""},
-                {"Concepto": "Flexibilidad operativa:", "Optimizado": "✅ Adaptable a restricciones", "FIFO Simple": "❌ Rígido y poco eficiente", "Mejora (%)": ""},
-                {"Concepto": "Restricción de viernes:", "Optimizado": "✅ No programa viernes (4 días hábiles)", "FIFO Simple": "✅ No programa viernes (4 días hábiles)", "Mejora (%)": "Implementado"},
-            ])
-            
-            # SIEMPRE crear y exportar la hoja
-            optimizacion_df = pd.DataFrame(optimizacion_data)
-            optimizacion_df.to_excel(writer, sheet_name="Optimizacion", index=False)
-            
-        except Exception as e:
-            # Fallback: crear hoja básica si hay error
-            fallback_data = [
-                {"Concepto": "ERROR EN ANÁLISIS", "Optimizado": f"Error: {str(e)}", "FIFO Simple": "No disponible", "Mejora (%)": "N/A"},
-                {"Concepto": "Descripción del modelo:", "Optimizado": "Optimización con fragmentación inteligente", "FIFO Simple": "FIFO simple con grupo B +1 día", "Mejora (%)": ""},
-                {"Concepto": "Programación:", "Optimizado": "Lunes a Jueves únicamente", "FIFO Simple": "Lunes a Jueves únicamente", "Mejora (%)": "Implementado"},
-            ]
-            fallback_df = pd.DataFrame(fallback_data)
-            fallback_df.to_excel(writer, sheet_name="Optimizacion", index=False)
+        # Eliminado: generación de hoja "Optimizacion" y ejecución del modelo FIFO/optimizado
+        # por petición del usuario. El Excel exporta ahora solo: Plan, Pendiente, Utilizacion y Gantt.
         
-        # NUEVA HOJA: Tasas de Llegada por Grupo
-        try:
-            if prueba is not None:
-                # Calcular tasas de llegada
-                arrival_rates = calculate_arrival_rates(prueba)
-                capacity_analysis = analyze_capacity_vs_arrival_rates(arrival_rates, daily_cap if daily_cap else 38)
-                
-                # Crear tabla de tasas de llegada
-                tasas_data = []
-                
-                # Encabezado
-                tasas_data.append({
-                    "Grupo": "ANÁLISIS DE TASAS DE LLEGADA POR GRUPO",
-                    "Tasa_Diaria_Muestras": "",
-                    "Total_Muestras_Historicas": "",
-                    "Dias_Periodo_Analizado": "",
-                    "Num_Registros": "",
-                    "Promedio_Muestras_por_Registro": "",
-                    "Porcentaje_Demanda_Total": "",
-                    "Capacidad_Proporcional_Sugerida": "",
-                    "Tiempo_Espera_Estimado_Dias": "",
-                    "Factor_Saturacion": "",
-                    "Prioridad_Capacidad": "",
-                    "Fecha_Inicio_Periodo": "",
-                    "Fecha_Fin_Periodo": ""
-                })
-                
-                tasas_data.append({
-                    "Grupo": "═══════════════════════════════════",
-                    "Tasa_Diaria_Muestras": "═══════════",
-                    "Total_Muestras_Historicas": "══════════════",
-                    "Dias_Periodo_Analizado": "══════════════",
-                    "Num_Registros": "════════",
-                    "Promedio_Muestras_por_Registro": "═══════════════════",
-                    "Porcentaje_Demanda_Total": "═══════════════",
-                    "Capacidad_Proporcional_Sugerida": "═══════════════════════",
-                    "Tiempo_Espera_Estimado_Dias": "═══════════════════",
-                    "Factor_Saturacion": "════════════",
-                    "Prioridad_Capacidad": "════════════════",
-                    "Fecha_Inicio_Periodo": "═══════════════",
-                    "Fecha_Fin_Periodo": "══════════════"
-                })
-                
-                # Datos por grupo
-                for grupo in ['A', 'B', 'C', 'D']:
-                    if grupo in arrival_rates:
-                        rates = arrival_rates[grupo]
-                        analysis = capacity_analysis.get(grupo, {})
-                        
-                        tasas_data.append({
-                            "Grupo": grupo,
-                            "Tasa_Diaria_Muestras": rates.get('tasa_diaria', 0),
-                            "Total_Muestras_Historicas": rates.get('total_muestras', 0),
-                            "Dias_Periodo_Analizado": rates.get('dias_periodo', 0),
-                            "Num_Registros": rates.get('num_registros', 0),
-                            "Promedio_Muestras_por_Registro": rates.get('promedio_por_registro', 0),
-                            "Porcentaje_Demanda_Total": f"{analysis.get('porcentaje_demanda', 0):.1f}%",
-                            "Capacidad_Proporcional_Sugerida": f"{analysis.get('capacidad_proporcional', 0):.1f}",
-                            "Tiempo_Espera_Estimado_Dias": f"{analysis.get('tiempo_espera_dias', 0):.1f}",
-                            "Factor_Saturacion": f"{analysis.get('saturacion', 0):.2f}x",
-                            "Prioridad_Capacidad": analysis.get('prioridad_capacidad', 'N/A'),
-                            "Fecha_Inicio_Periodo": rates.get('fecha_inicio', 'N/A'),
-                            "Fecha_Fin_Periodo": rates.get('fecha_fin', 'N/A')
-                        })
-                
-                # Análisis global
-                if 'GLOBAL' in capacity_analysis:
-                    global_stats = capacity_analysis['GLOBAL']
-                    tasas_data.extend([
-                        {
-                            "Grupo": "",
-                            "Tasa_Diaria_Muestras": "",
-                            "Total_Muestras_Historicas": "",
-                            "Dias_Periodo_Analizado": "",
-                            "Num_Registros": "",
-                            "Promedio_Muestras_por_Registro": "",
-                            "Porcentaje_Demanda_Total": "",
-                            "Capacidad_Proporcional_Sugerida": "",
-                            "Tiempo_Espera_Estimado_Dias": "",
-                            "Factor_Saturacion": "",
-                            "Prioridad_Capacidad": "",
-                            "Fecha_Inicio_Periodo": "",
-                            "Fecha_Fin_Periodo": ""
-                        },
-                        {
-                            "Grupo": "ANÁLISIS GLOBAL DEL SISTEMA",
-                            "Tasa_Diaria_Muestras": f"{global_stats.get('tasa_total', 0):.2f}",
-                            "Total_Muestras_Historicas": "Demanda Total/Día",
-                            "Dias_Periodo_Analizado": f"{global_stats.get('capacidad_disponible', 0)}",
-                            "Num_Registros": "Cap. Disponible",
-                            "Promedio_Muestras_por_Registro": f"{global_stats.get('utilizacion_capacidad', 0):.1f}%",
-                            "Porcentaje_Demanda_Total": "Utilización",
-                            "Capacidad_Proporcional_Sugerida": f"{global_stats.get('deficit_superavit', 0):+.1f}",
-                            "Tiempo_Espera_Estimado_Dias": "Balance Diario",
-                            "Factor_Saturacion": global_stats.get('estado_sistema', 'N/A'),
-                            "Prioridad_Capacidad": "Estado Sistema",
-                            "Fecha_Inicio_Periodo": "",
-                            "Fecha_Fin_Periodo": ""
-                        }
-                    ])
-                
-                # Crear y exportar DataFrame de tasas
-                tasas_df = pd.DataFrame(tasas_data)
-                tasas_df.to_excel(writer, sheet_name="Tasas_Llegada", index=False)
-            else:
-                # Fallback si no hay datos
-                fallback_tasas = pd.DataFrame([
-                    {"Grupo": "Sin datos disponibles", "Tasa_Diaria_Muestras": "N/A", "Informacion": "Requiere datos históricos para calcular tasas"}
-                ])
-                fallback_tasas.to_excel(writer, sheet_name="Tasas_Llegada", index=False)
-                
-        except Exception as e:
-            # Fallback en caso de error
-            error_tasas = pd.DataFrame([
-                {"Grupo": "ERROR", "Tasa_Diaria_Muestras": f"Error: {str(e)}", "Informacion": "No se pudieron calcular las tasas de llegada"}
-            ])
-            error_tasas.to_excel(writer, sheet_name="Tasas_Llegada", index=False)
+        # NOTE: Eliminado el bloque de 'Tasas_Llegada' (análisis históricos) por petición.
     
     return out.getvalue()
 
 # =============================
 # UI
 # =============================
-st.sidebar.header("Configuración de datos")
+# Leer configuración persistente de forma silenciosa (sin exponerla en la UI)
+config = read_config()
+
+# Nota: La edición/visualización de `config.json` fue removida de la interfaz.
+# La configuración se aplica automáticamente como fallback cuando no se sube
+# un Excel o cuando falta la hoja 'Tiempo'.
+
 default_path = "Insumo_Planeacion.xlsx"
 uploaded = st.sidebar.file_uploader("Cargar Excel personalizado", type=["xlsx", "xlsm"])
+
+# Cargar datos desde Excel (si el usuario sube uno). Si no se sube pero se selecciona usar persistente,
+# usaremos la capacidad y tiempos guardados para sobreescribir lo cargado desde Excel.
 foliar, prueba, tiempo, daily_cap = load_data(default_path, uploaded.getvalue() if uploaded else None)
 
-tab1, tab2, tab3 = st.tabs(["📚 Históricos", "🗓️ Planeación por día (capacidad diaria)", "⚡ Análisis de Optimización"])
+# Aplicar configuración persistente automáticamente solo si NO se subió un Excel
+# (la edición de config.json fue removida de la UI)
+if uploaded is None and config:
+    cfg = config
+    try:
+        daily_cap = int(cfg.get("daily_cap", daily_cap))
+    except Exception:
+        pass
 
-with tab1:
-    st.dataframe(foliar, use_container_width=True)
-    kpis = compute_kpis(foliar)
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric(label="% Cumplimiento (Aplican = SI)", value=f"{kpis.get('% Cumplimiento (solo Aplican=SI)', 0.0):.1f}%")
-    with c2:
-        st.metric(label="Tiempo promedio de entrega (días)", value=f"{kpis.get('Tiempo promedio de entrega (días)', 0.0):.2f}")
-    with c3:
-        st.metric(label="Casos considerados", value=f"{int(kpis.get('Casos considerados (Aplican=SI)', 0.0))}")
+    # Construir DataFrame `tiempo` a partir de la configuración
+    times = cfg.get("times", {})
+    tiempo_rows = []
+    for g, vals in times.items():
+        tiempo_rows.append({
+            "Grupo": g,
+            "Tiempo de prealistamiento (horas)": float(vals.get("pre", 0.0)),
+            "Tiempo procesamiento (horas)": float(vals.get("proc", 0.0))
+        })
+    try:
+        tiempo = pd.DataFrame(tiempo_rows)
+    except Exception:
+        # si falla, dejar el tiempo tal como lo cargó load_data
+        pass
 
-with tab2:
+# Si la hoja 'Tiempo' no existía en el Excel y no contiene datos, aplicar config como fallback
+if (tiempo is None) or ("Grupo" not in tiempo.columns) or tiempo.empty:
+    cfg = config
+    times = cfg.get("times", {})
+    tiempo_rows = []
+    for g, vals in times.items():
+        tiempo_rows.append({
+            "Grupo": g,
+            "Tiempo de prealistamiento (horas)": float(vals.get("pre", 0.0)),
+            "Tiempo procesamiento (horas)": float(vals.get("proc", 0.0))
+        })
+    try:
+        tiempo = pd.DataFrame(tiempo_rows)
+    except Exception:
+        pass
+    try:
+        daily_cap = int(cfg.get("daily_cap", daily_cap))
+    except Exception:
+        pass
+
+tab = st.container()
+
+with tab:
     st.subheader("Parámetros de planeación (Lun–Vie)")
     today = datetime.today()
     selected_date = st.date_input("Selecciona cualquier día de la semana a planificar", value= today)
@@ -1656,118 +1289,7 @@ with tab2:
 
         # Detalles técnicos en expanders
         
-        # NUEVO EXPANDER: Análisis de Tasas de Llegada
-        with st.expander("📈 Análisis de Tasas de Llegada por Grupo"):
-            st.markdown("""
-            **🎯 Análisis Temporal de Demanda por Grupo**
-            
-            Este análisis calcula la **tasa de llegada diaria** de muestras por cada grupo (A, B, C, D) 
-            basado en los datos históricos disponibles.
-            """)
-            
-            # Calcular tasas de llegada para mostrar
-            arrival_rates = calculate_arrival_rates(prueba)
-            capacity_analysis = analyze_capacity_vs_arrival_rates(arrival_rates, daily_cap)
-            
-            if arrival_rates:
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.subheader("📊 Tasas de Llegada Calculadas")
-                    
-                    # Crear DataFrame para mostrar las tasas
-                    rates_data = []
-                    for grupo, data in arrival_rates.items():
-                        if grupo in ['A', 'B', 'C', 'D']:
-                            rates_data.append({
-                                '🎯 Grupo': grupo,
-                                '📈 Tasa Diaria': f"{data['tasa_diaria']:.2f}",
-                                '🧪 Total Muestras': data['total_muestras'],
-                                '📅 Días': data['dias_periodo'],
-                                '📋 Registros': data['num_registros'],
-                                '⚖️ Prom/Reg': f"{data['promedio_por_registro']:.1f}"
-                            })
-                    
-                    df_rates = pd.DataFrame(rates_data)
-                    st.dataframe(df_rates, use_container_width=True, hide_index=True)
-                
-                with col2:
-                    st.subheader("⚖️ Análisis de Capacidad")
-                    
-                    # Análisis detallado por grupo
-                    analysis_data = []
-                    for grupo in ['A', 'B', 'C', 'D']:
-                        if grupo in capacity_analysis:
-                            data = capacity_analysis[grupo]
-                            analysis_data.append({
-                                '🎯 Grupo': grupo,
-                                '📊 % Demanda': f"{data['porcentaje_demanda']:.1f}%",
-                                '⚖️ Cap. Sugerida': f"{data['capacidad_proporcional']:.1f}",
-                                '🔥 Saturación': f"{data['saturacion']:.2f}x",
-                                '⚡ Prioridad': data['prioridad_capacidad']
-                            })
-                    
-                    df_analysis = pd.DataFrame(analysis_data)
-                    
-                    # Colorear según prioridad
-                    def color_priority_mini(val):
-                        if val == 'CRÍTICA':
-                            return 'background-color: #ffebee; color: #c62828; font-weight: bold'
-                        elif val == 'ALTA':
-                            return 'background-color: #fff3e0; color: #ef6c00; font-weight: bold'
-                        elif val == 'MEDIA':
-                            return 'background-color: #f3e5f5; color: #7b1fa2'
-                        else:
-                            return 'background-color: #e8f5e8; color: #2e7d32'
-                    
-                    styled_df_mini = df_analysis.style.map(color_priority_mini, subset=['⚡ Prioridad'])
-                    st.dataframe(styled_df_mini, use_container_width=True, hide_index=True)
-                
-                # Análisis global del sistema
-                if 'GLOBAL' in capacity_analysis:
-                    global_stats = capacity_analysis['GLOBAL']
-                    
-                    st.subheader("🌐 Estado Global del Sistema")
-                    col1, col2, col3, col4 = st.columns(4)
-                    
-                    with col1:
-                        st.metric("🔥 Demanda Total", f"{global_stats['tasa_total']:.1f} muestras/día")
-                    with col2:
-                        st.metric("⚡ Capacidad Disp.", f"{global_stats['capacidad_disponible']} muestras/día")
-                    with col3:
-                        utilizacion = global_stats['utilizacion_capacidad']
-                        st.metric("📊 Utilización", f"{utilizacion:.1f}%")
-                    with col4:
-                        deficit = global_stats['deficit_superavit']
-                        st.metric("📈 Balance", f"{deficit:+.1f} muestras/día")
-                    
-                    # Estado del sistema
-                    estado = global_stats['estado_sistema']
-                    if estado == 'SOBRECARGADO':
-                        st.error(f"🚨 **Sistema {estado}**: La demanda excede la capacidad diaria disponible")
-                    elif estado == 'EQUILIBRADO':
-                        st.success(f"✅ **Sistema {estado}**: Demanda dentro de límites operativos")
-                    # Para 'SUBUTILIZADO' no mostrar el texto de advertencia sobre capacidad infrautilizada
-                    
-                    # Recomendaciones compactas
-                    recomendaciones = []
-                    for grupo in ['A', 'B', 'C', 'D']:
-                        if grupo in capacity_analysis:
-                            data = capacity_analysis[grupo]
-                            prioridad = data['prioridad_capacidad']
-                            
-                            if prioridad == 'CRÍTICA':
-                                recomendaciones.append(f"🚨 **{grupo}**: Saturación crítica")
-                            elif prioridad == 'ALTA':
-                                recomendaciones.append(f"⚠️ **{grupo}**: Alta demanda")
-                    
-                    if recomendaciones:
-                        st.markdown("**💡 Alertas:**")
-                        for rec in recomendaciones:
-                            st.markdown(f"- {rec}")
-                            
-            else:
-                st.warning("⚠️ No se pudieron calcular las tasas de llegada. Verificar datos de fecha en las muestras.")
+        # Eliminado: análisis de tasas de llegada (históricos) por petición del usuario.
 
         with st.expander("📋 Detalle Completo de la Planeación"):
             st.dataframe(schedule, use_container_width=True)
@@ -1956,182 +1478,13 @@ with tab2:
                 with col3:
                     st.metric("🌅 Prealist. Anticipados", total_prep_anticipados)
 
-        xls_bytes = to_excel_download(schedule, pendientes, util_df, gantt_week, gantt_per_day, 
-                                     prueba, tiempo, datetime.combine(selected_date, DAY_START), daily_cap)
+        xls_bytes = to_excel_download(schedule, pendientes, util_df, gantt_week, gantt_per_day)
         st.download_button(
-            label="⬇️ Descargar plan completo con análisis de optimización",
+            label="⬇️ Descargar plan (semana)",
             data=xls_bytes,
-            file_name="planeacion_semana_con_optimizacion.xlsx",
+            file_name="planeacion_semana.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-with tab3:
-    st.header("⚡ Análisis Comparativo de Optimización")
-    
-    st.markdown("""
-    ### 🎯 Descripción del Modelo de Optimización Implementado
-    
-    El sistema utiliza una **heurística de optimización avanzada** que combina:
-    """)
-    
-    col1, col2 = st.columns(2)
-    
-    st.markdown("### 📊 Comparación en Tiempo Real")
-    
-    # Parámetros independientes para esta pestaña
-    st.subheader("Configuración del Análisis")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        fecha_analisis = st.date_input("� Selecciona fecha para análisis", value=datetime.today(), key="fecha_opt")
-    with col2:
-        st.info(f"🧪 Capacidad diaria: {daily_cap if daily_cap else 'Sin límite'} muestras/día")
-    
-    if st.button("🔄 Ejecutar Análisis Comparativo Completo", key="analisis_comp"):
-        with st.spinner("Ejecutando ambos algoritmos para comparación completa..."):
-            try:
-                # Ejecutar AMBOS algoritmos de forma independiente
-                fecha_datetime = datetime.combine(fecha_analisis, DAY_START)
-                
-                # 1. Ejecutar modelo OPTIMIZADO
-                st.info("🚀 Ejecutando modelo optimizado...")
-                schedule_opt, pendientes_opt, util_df_opt, gantt_week_opt, gantt_per_day_opt, df_progreso_opt, registros_info_opt = plan_week_by_day(prueba, tiempo, fecha_datetime, daily_cap)
-                
-                # 2. Ejecutar modelo FIFO SIMPLE  
-                st.info("🐌 Ejecutando modelo FIFO simple...")
-                schedule_fifo, pendientes_fifo = plan_fifo_simple(prueba, tiempo, fecha_datetime, daily_cap)
-                    
-                # 3. Calcular métricas comparativas correctas
-                st.success("✅ Ambos algoritmos ejecutados correctamente")
-                
-                # Calcular total de muestras disponibles en el dataset
-                df_original_temp = expand_analyses(prueba)
-                total_muestras_disponibles = df_original_temp["No muestras"].sum()
-                
-                # Métricas del modelo optimizado
-                muestras_opt = schedule_opt["Muestras"].sum() if isinstance(schedule_opt, pd.DataFrame) and not schedule_opt.empty and "Muestras" in schedule_opt.columns else 0
-                pendientes_opt_total = pendientes_opt["Pendiente"].sum() if isinstance(pendientes_opt, pd.DataFrame) and not pendientes_opt.empty and "Pendiente" in pendientes_opt.columns else (total_muestras_disponibles - muestras_opt)
-                # Calcular días utilizados y estimar días necesarios totales
-                dias_utilizados_opt = len(schedule_opt["Fecha"].unique()) if isinstance(schedule_opt, pd.DataFrame) and not schedule_opt.empty and "Fecha" in schedule_opt.columns else 0
-                # Estimar días necesarios totales (más realista considerando pendientes)
-                if pendientes_opt_total > 0:
-                    dias_adicionales_necesarios_opt = math.ceil(pendientes_opt_total / daily_cap) if daily_cap and daily_cap > 0 else 0
-                    dias_reales_necesarios_opt = dias_utilizados_opt + dias_adicionales_necesarios_opt
-                else:
-                    dias_reales_necesarios_opt = dias_utilizados_opt
-                
-                # Métricas del FIFO simple  
-                muestras_fifo = schedule_fifo["Muestras"].sum() if isinstance(schedule_fifo, pd.DataFrame) and not schedule_fifo.empty and "Muestras" in schedule_fifo.columns else 0
-                # El FIFO usa columna "Muestras" para pendientes, no "Pendiente"
-                pendientes_fifo_total = pendientes_fifo["Muestras"].sum() if isinstance(pendientes_fifo, pd.DataFrame) and not pendientes_fifo.empty and "Muestras" in pendientes_fifo.columns else (total_muestras_disponibles - muestras_fifo)
-                # Calcular días utilizados y estimar días necesarios totales
-                dias_utilizados_fifo = len(schedule_fifo["Fecha"].unique()) if isinstance(schedule_fifo, pd.DataFrame) and not schedule_fifo.empty and "Fecha" in schedule_fifo.columns else 0
-                # Estimar días necesarios totales (más realista considerando pendientes)  
-                if pendientes_fifo_total > 0:
-                    dias_adicionales_necesarios_fifo = math.ceil(pendientes_fifo_total / daily_cap) if daily_cap and daily_cap > 0 else 0
-                    dias_reales_necesarios_fifo = dias_utilizados_fifo + dias_adicionales_necesarios_fifo
-                else:
-                    dias_reales_necesarios_fifo = dias_utilizados_fifo
-                
-                # Validación de consistencia
-                if muestras_opt + pendientes_opt_total != total_muestras_disponibles:
-                    pendientes_opt_total = max(0, total_muestras_disponibles - muestras_opt)
-                if muestras_fifo + pendientes_fifo_total != total_muestras_disponibles:
-                    pendientes_fifo_total = max(0, total_muestras_disponibles - muestras_fifo)
-                
-                # Mostrar debug info
-                st.info(f"""
-                📊 **Información de Debug:**
-                - Total muestras disponibles: {total_muestras_disponibles:,.0f}
-                - Optimizado: {muestras_opt:,.0f} procesadas + {pendientes_opt_total:,.0f} pendientes = {muestras_opt + pendientes_opt_total:,.0f}
-                - FIFO: {muestras_fifo:,.0f} procesadas + {pendientes_fifo_total:,.0f} pendientes = {muestras_fifo + pendientes_fifo_total:,.0f}
-                - Días utilizados: Opt={dias_utilizados_opt}, FIFO={dias_utilizados_fifo}
-                - Días estimados necesarios: Opt={dias_reales_necesarios_opt}, FIFO={dias_reales_necesarios_fifo}
-                """)
-                    
-                # 4. Mostrar comparación visual
-                st.markdown("### 📈 Resultados del Análisis Comparativo")
-                
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    mejora_muestras = muestras_opt - muestras_fifo
-                    st.metric(
-                        "🧪 Muestras Procesadas (Optimizado)", 
-                        f"{muestras_opt:,.0f}",
-                        delta=f"{mejora_muestras:+.0f} vs FIFO ({muestras_fifo:,.0f})"
-                    )
-                
-                with col2:
-                    reduccion_pendientes = pendientes_fifo_total - pendientes_opt_total
-                    st.metric(
-                        "⏳ Muestras Pendientes (Optimizado)", 
-                        f"{pendientes_opt_total:,.0f}",
-                        delta=f"{reduccion_pendientes:+.0f} menos que FIFO ({pendientes_fifo_total:,.0f})",
-                        delta_color="inverse"
-                    )
-                
-                with col3:
-                    ahorro_dias = max(0, dias_reales_necesarios_fifo - dias_reales_necesarios_opt)
-                    st.metric(
-                        "📅 Días Necesarios (Optimizado)", 
-                        f"{dias_reales_necesarios_opt}",
-                        delta=f"vs {dias_reales_necesarios_fifo} días FIFO ({ahorro_dias} ahorrados)" if ahorro_dias > 0 else f"vs {dias_reales_necesarios_fifo} días FIFO (mismo)"
-                    )
-                    
-                    # Tabla comparativa detallada
-                    st.markdown("### 📋 Resultados Detallados")
-                    
-                # 5. Tabla comparativa detallada
-                st.markdown("### 📋 Resultados Detallados")
-                
-                comparacion_data = [
-                    {"Métrica": "Muestras procesadas", "Optimizado": f"{muestras_opt:,.0f}", "FIFO Simple": f"{muestras_fifo:,.0f}", "Mejora": f"{((muestras_opt - muestras_fifo) / max(muestras_fifo, 1) * 100):+.1f}%"},
-                    {"Métrica": "Muestras pendientes", "Optimizado": f"{pendientes_opt_total:,.0f}", "FIFO Simple": f"{pendientes_fifo_total:,.0f}", "Mejora": f"{((pendientes_fifo_total - pendientes_opt_total) / max(pendientes_fifo_total, 1) * 100):+.1f}%"},
-                    {"Métrica": "Días necesarios (estimación real)", "Optimizado": f"{dias_reales_necesarios_opt}", "FIFO Simple": f"{dias_reales_necesarios_fifo}", "Mejora": f"{ahorro_dias} días menos"},
-                    {"Métrica": "Días utilizados (L-J)", "Optimizado": f"{dias_utilizados_opt}", "FIFO Simple": f"{dias_utilizados_fifo}", "Mejora": f"{max(0, dias_utilizados_fifo - dias_utilizados_opt)} días menos"},
-                    {"Métrica": "Utilización capacidad", "Optimizado": f"{(muestras_opt/(dias_utilizados_opt*daily_cap)*100):,.1f}%" if dias_utilizados_opt > 0 and daily_cap > 0 else "N/A", "FIFO Simple": f"{(muestras_fifo/(dias_utilizados_fifo*daily_cap)*100):,.1f}%" if dias_utilizados_fifo > 0 and daily_cap > 0 else "N/A", "Mejora": ""}
-                ]
-                
-                df_comparacion = pd.DataFrame(comparacion_data)
-                st.dataframe(df_comparacion, use_container_width=True, hide_index=True)
-                
-                # 6. Conclusiones automáticas
-                st.markdown("### 🎯 Conclusiones del Análisis")
-                
-                mejora_general = ((muestras_opt - muestras_fifo) / max(muestras_fifo, 1) * 100) if muestras_fifo > 0 else 0
-                
-                if mejora_general > 0:
-                    st.success(f"✅ **El modelo optimizado es {mejora_general:.1f}% más eficiente** que FIFO simple")
-                elif mejora_general == 0:
-                    st.info("ℹ️ Ambos modelos tienen rendimiento similar en este caso")
-                else:
-                    st.warning(f"⚠️ FIFO simple procesó {abs(mejora_general):.1f}% más muestras")
-                
-                st.markdown(f"""
-                **📊 Resumen de Ventajas del Modelo Optimizado:**
-                - 🚀 Procesa **{muestras_opt:,.0f}** muestras vs **{muestras_fifo:,.0f}** del FIFO simple
-                - ⚡ Deja **{pendientes_opt_total:,.0f}** pendientes vs **{pendientes_fifo_total:,.0f}** del FIFO simple  
-                - 📅 Necesitaría **{dias_reales_necesarios_opt}** días vs **{dias_reales_necesarios_fifo}** del FIFO simple
-                - 🗓️ Utiliza **{dias_utilizados_opt}** días (L-J) vs **{dias_utilizados_fifo}** del FIFO simple
-                - 🎯 Respeta restricciones de negocio (martes B+C, entrega completa)
-                - 💡 Maximiza utilización de capacidad diaria disponible
-                - 🚫 No programa trabajo los viernes (lunes a jueves únicamente)
-                """)
-                
-                # 7. Mostrar planes generados
-                with st.expander("📋 Ver Plan Generado - Modelo Optimizado"):
-                    if not schedule_opt.empty:
-                        st.dataframe(schedule_opt, use_container_width=True)
-                    else:
-                        st.info("No se generaron tareas programadas")
-                        
-                with st.expander("📋 Ver Plan Generado - FIFO Simple"):
-                    if not schedule_fifo.empty:
-                        st.dataframe(schedule_fifo, use_container_width=True)
-                    else:
-                        st.info("No se generaron tareas programadas")
-                
-            except Exception as e:
-                st.error(f"❌ Error en el análisis: {str(e)}")
-                st.info("💡 Verifica que los datos estén cargados correctamente")
+# Eliminado: pestaña y UI de 'Análisis Comparativo de Optimización' por petición del usuario.
+# Si se requiere volver a añadir comparación, podemos reimplementar una versión mínima sin dependencias históricas.
